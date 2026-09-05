@@ -1,0 +1,6 @@
+{
+  "name": "Zepp OS Full AOD Converter",
+  "description": "Client-side PWA tool to convert Zepp OS and Amazfit watchface packages (.zpk/.zip) into Full Always-On Display (FAOD) packages with unified layouts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
