@@ -10,9 +10,10 @@ import {
   PackageMetadata, 
   PowerAnalysisReport, 
   WatchfaceFileItem 
-} from '../types';
-import { resolveDeviceDetails, resolveDeviceNames } from './devices';
-import { analyzeWatchfacePower, applyBatteryOptimizations } from './powerAnalyzer';
+} from '../types.ts';
+import { resolveDeviceDetails, resolveDeviceNames } from './devices.ts';
+import { analyzeWatchfacePower, applyBatteryOptimizations } from './powerAnalyzer.ts';
+import { transformWatchfaceScript } from './astTransformer.ts';
 
 export function createLog(
   level: LogMessage['level'],
@@ -28,6 +29,369 @@ export function createLog(
     message,
     details
   };
+}
+
+/**
+ * Strip leading UTF-8 Byte Order Mark (\uFEFF) if present.
+ */
+export function stripBom(str: string): string {
+  if (!str) return str;
+  return str.charCodeAt(0) === 0xFEFF ? str.slice(1) : str;
+}
+
+/**
+ * Normalizes Windows-style path backslashes to forward slashes across all entries in the zip.
+ */
+export async function normalizeZipEntryPaths(zip: JSZip): Promise<number> {
+  let count = 0;
+  const paths = Object.keys(zip.files);
+  for (const p of paths) {
+    if (p.includes('\\')) {
+      const normalized = p.replace(/\\+/g, '/');
+      const fileEntry = zip.files[p];
+      if (fileEntry && !fileEntry.dir) {
+        const content = await fileEntry.async('arraybuffer');
+        zip.file(normalized, content);
+      }
+      zip.remove(p);
+      count++;
+    }
+  }
+  return count;
+}
+
+export interface DeviceTargetSpec {
+  hex: string;
+  name: string;
+  deviceSource: number;
+}
+
+export const UNIVERSAL_TARGET_DEVICES: DeviceTargetSpec[] = [
+  { hex: '0x00000079', name: 'Amazfit Balance', deviceSource: 121 },
+  { hex: '0x0000007B', name: 'Amazfit Cheetah', deviceSource: 123 },
+  { hex: '0x0000007C', name: 'Amazfit Cheetah Pro', deviceSource: 124 },
+  { hex: '0x00000072', name: 'Amazfit Falcon', deviceSource: 114 },
+  { hex: '0x00000059', name: 'Amazfit GTR 3', deviceSource: 89 },
+  { hex: '0x0000005A', name: 'Amazfit GTR 3 Pro', deviceSource: 90 },
+  { hex: '0x00000067', name: 'Amazfit GTR 4', deviceSource: 103 },
+  { hex: '0x00000069', name: 'Amazfit T-Rex 2', deviceSource: 105 },
+  { hex: '0x00000073', name: 'Amazfit T-Rex Ultra', deviceSource: 115 },
+  { hex: '0x00000078', name: 'Amazfit Active', deviceSource: 120 },
+  { hex: '0x0000007A', name: 'Amazfit Active Edge', deviceSource: 122 },
+];
+
+export interface ManifestModernizationResult {
+  repairedCount: number;
+  summary: string[];
+}
+
+export function modernizeManifestSchema(manifestJson: any): ManifestModernizationResult {
+  let repairedCount = 0;
+  const summary: string[] = [];
+
+  // 1. Enforce configVersion: "v2"
+  if (manifestJson.configVersion !== 'v2') {
+    manifestJson.configVersion = 'v2';
+    repairedCount++;
+    summary.push('Migrated configVersion to "v2"');
+  }
+
+  // 2. Enforce designWidth: 480
+  if (typeof manifestJson.designWidth !== 'number' || manifestJson.designWidth <= 0) {
+    manifestJson.designWidth = 480;
+    repairedCount++;
+    summary.push('Injected "designWidth": 480');
+  }
+
+  // 3. Ensure app and app.cover: ["preview.png"]
+  manifestJson.app = manifestJson.app || {};
+  if (!Array.isArray(manifestJson.app.cover) || manifestJson.app.cover.length === 0) {
+    manifestJson.app.cover = ['preview.png'];
+    repairedCount++;
+    summary.push('Configured "app.cover": ["preview.png"]');
+  }
+  if (!manifestJson.app.icon || manifestJson.app.icon.toLowerCase() === 'preview.png') {
+    manifestJson.app.icon = 'preview.png';
+  }
+  manifestJson.cover = ['preview.png'];
+
+  // App ID normalization
+  if (manifestJson.app && typeof manifestJson.app === 'object') {
+    if (!manifestJson.app.appId || typeof manifestJson.app.appId !== 'number') {
+      manifestJson.app.appId = typeof manifestJson.app.appId === 'string' && /^\d+$/.test(manifestJson.app.appId)
+        ? parseInt(manifestJson.app.appId, 10)
+        : 849201;
+    }
+  }
+
+  // 4. Authorize AOD CPU Budget: hightCost: 0
+  if (!manifestJson.module) {
+    manifestJson.module = {
+      watchface: { path: 'watchface/index', showInAod: true, secondHand: true, hightCost: 0, main: 1, editable: 0, lockscreen: 1 },
+      idle: { path: 'idle/index', showInAod: true, secondHand: true, hightCost: 0, main: 1, editable: 0, lockscreen: 1 }
+    };
+    repairedCount += 2;
+    summary.push('Created module.watchface and module.idle with "hightCost": 0');
+  } else {
+    manifestJson.module.watchface = {
+      path: 'watchface/index',
+      main: 1,
+      editable: 0,
+      lockscreen: 1,
+      ...manifestJson.module.watchface,
+      showInAod: true,
+      secondHand: true,
+      hightCost: 0
+    };
+    const wfPath = manifestJson.module.watchface?.path || 'watchface/index';
+    const defaultIdlePath = wfPath.replace(/^watchface\//, 'idle/').replace(/^page\/watchface\//, 'page/idle/') || 'idle/index';
+    manifestJson.module.idle = {
+      main: 1,
+      editable: 0,
+      lockscreen: 1,
+      ...manifestJson.module.watchface,
+      ...(manifestJson.module.idle || {}),
+      path: manifestJson.module.idle?.path || defaultIdlePath,
+      showInAod: true,
+      secondHand: true,
+      hightCost: 0
+    };
+    repairedCount += 2;
+    summary.push('Injected "hightCost": 0 into module.watchface and module.idle');
+  }
+
+  // Nested targets hightCost injection
+  if (manifestJson.targets && typeof manifestJson.targets === 'object') {
+    for (const key of Object.keys(manifestJson.targets)) {
+      const targetObj = manifestJson.targets[key];
+      if (targetObj && typeof targetObj === 'object') {
+        if (targetObj.module) {
+          if (targetObj.module.watchface) {
+            targetObj.module.watchface.hightCost = 0;
+            targetObj.module.watchface.showInAod = true;
+            targetObj.module.watchface.secondHand = true;
+          }
+          if (targetObj.module.idle) {
+            targetObj.module.idle.hightCost = 0;
+            targetObj.module.idle.showInAod = true;
+            targetObj.module.idle.secondHand = true;
+          }
+        }
+        targetObj.defaultAOD = true;
+        targetObj.showInAod = true;
+        targetObj.secondHand = true;
+        targetObj.secondHandInAod = true;
+      }
+    }
+  }
+
+  // 5. Universal Device Whitelist (11 Hex Values)
+  const canonicalMap = new Map<string, string>();
+  for (const t of UNIVERSAL_TARGET_DEVICES) {
+    canonicalMap.set(t.hex.toUpperCase(), t.hex);
+  }
+
+  const existingDevices: string[] = Array.isArray(manifestJson.deviceSource)
+    ? manifestJson.deviceSource
+    : Array.isArray(manifestJson.app?.deviceSource)
+    ? manifestJson.app.deviceSource
+    : [];
+
+  const mergedDevices: string[] = [];
+  const added = new Set<string>();
+
+  for (const dev of existingDevices) {
+    const upper = String(dev).toUpperCase();
+    const canonical = canonicalMap.get(upper) || dev;
+    if (!added.has(String(canonical).toUpperCase())) {
+      mergedDevices.push(canonical);
+      added.add(String(canonical).toUpperCase());
+    }
+  }
+
+  for (const t of UNIVERSAL_TARGET_DEVICES) {
+    if (!added.has(t.hex.toUpperCase())) {
+      mergedDevices.push(t.hex);
+      added.add(t.hex.toUpperCase());
+    }
+  }
+
+  manifestJson.deviceSource = mergedDevices;
+  if (manifestJson.app) manifestJson.app.deviceSource = mergedDevices;
+
+  // 6. Structured device.platforms
+  manifestJson.device = manifestJson.device || {};
+  if (!Array.isArray(manifestJson.device.targets) || manifestJson.device.targets.length === 0) {
+    manifestJson.device.targets = ['gts'];
+  }
+
+  const structuredPlatforms: { name: string; deviceSource: number }[] = [];
+  const registeredSources = new Set<number>();
+
+  // Preserve any existing object-based platforms
+  if (Array.isArray(manifestJson.device.platforms)) {
+    for (const p of manifestJson.device.platforms) {
+      if (typeof p === 'object' && p !== null && typeof p.deviceSource === 'number') {
+        structuredPlatforms.push(p);
+        registeredSources.add(p.deviceSource);
+      }
+    }
+  }
+
+  // Append 11 universal platforms if not already present
+  for (const target of UNIVERSAL_TARGET_DEVICES) {
+    if (!registeredSources.has(target.deviceSource)) {
+      structuredPlatforms.push({
+        name: target.name,
+        deviceSource: target.deviceSource
+      });
+      registeredSources.add(target.deviceSource);
+    }
+  }
+  manifestJson.device.platforms = structuredPlatforms;
+  repairedCount++;
+  summary.push('Injected structured platforms for all 11 universal device targets');
+
+  // 7. Root flags
+  manifestJson.defaultAOD = true;
+  manifestJson.showInAod = true;
+  manifestJson.secondHand = true;
+  manifestJson.secondHandInAod = true;
+
+  return { repairedCount, summary };
+}
+
+/**
+ * Unconditionally mirrors all graphic assets in the archive into:
+ * - assets/
+ * - watchface/assets/
+ * - idle/assets/
+ * (and page/ folders if present)
+ */
+export async function mirrorAllGraphicAssets(zip: JSZip): Promise<number> {
+  let mirroredCount = 0;
+  const imageExtensions = /\.(png|jpg|jpeg|webp|bin|bmp|tga)$/i;
+  const paths = Object.keys(zip.files);
+  const hasPageFolder = paths.some(p => p.startsWith('page/'));
+
+  // Collect all graphic assets regardless of location
+  const assetMap = new Map<string, ArrayBuffer>();
+
+  for (const p of paths) {
+    const fileEntry = zip.files[p];
+    if (!fileEntry || fileEntry.dir) continue;
+    if (imageExtensions.test(p)) {
+      const buffer = await fileEntry.async('arraybuffer');
+      if (buffer.byteLength > 0) {
+        const fileName = p.split('/').pop()!;
+        if (!assetMap.has(fileName)) {
+          assetMap.set(fileName, buffer);
+        }
+      }
+    }
+  }
+
+  for (const [fileName, buffer] of assetMap.entries()) {
+    const destinations = [
+      `assets/${fileName}`,
+      `watchface/assets/${fileName}`,
+      `idle/assets/${fileName}`
+    ];
+    if (hasPageFolder) {
+      destinations.push(`page/watchface/assets/${fileName}`);
+      destinations.push(`page/idle/assets/${fileName}`);
+    }
+
+    for (const dst of destinations) {
+      if (!zip.file(dst)) {
+        zip.file(dst, buffer);
+        mirroredCount++;
+      }
+    }
+  }
+
+  return mirroredCount;
+}
+
+/**
+ * Locates the best preview image candidate and guarantees identical preview.png
+ * exists at all 5 ubiquitous Zepp OS runtime paths.
+ */
+export async function ensureUbiquitousPreview(zip: JSZip, manifestJson?: any): Promise<boolean> {
+  const paths = Object.keys(zip.files);
+  let previewBuffer: ArrayBuffer | null = null;
+
+  // 1. Direct preview candidate paths (case-insensitive)
+  const candidateNames = ['preview.png', 'preview.jpg', 'preview.jpeg'];
+  for (const p of paths) {
+    const lower = p.toLowerCase();
+    const fileName = lower.split('/').pop() || '';
+    if (candidateNames.includes(fileName)) {
+      const fileEntry = zip.files[p];
+      if (fileEntry && !fileEntry.dir) {
+        const buf = await fileEntry.async('arraybuffer');
+        if (buf.byteLength > 0) {
+          previewBuffer = buf;
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Check icon specified in manifest
+  if (!previewBuffer && manifestJson?.app?.icon) {
+    const iconName = String(manifestJson.app.icon).toLowerCase();
+    const matchingPath = paths.find(p => {
+      const pName = p.split('/').pop()?.toLowerCase();
+      return pName === iconName;
+    });
+    if (matchingPath) {
+      const fileEntry = zip.files[matchingPath];
+      if (fileEntry && !fileEntry.dir) {
+        const buf = await fileEntry.async('arraybuffer');
+        if (buf.byteLength > 0) previewBuffer = buf;
+      }
+    }
+  }
+
+  // 3. Fallback to dial background candidate
+  if (!previewBuffer) {
+    const imageExtensions = /\.(png|jpg|jpeg|webp)$/i;
+    const imageFiles: { path: string; size: number }[] = [];
+    for (const p of paths) {
+      const fileEntry = zip.files[p];
+      if (!fileEntry || fileEntry.dir) continue;
+      if (imageExtensions.test(p)) {
+        imageFiles.push({ path: p, size: (fileEntry as any)._data?.uncompressedSize || 0 });
+      }
+    }
+
+    const dialCandidate = imageFiles.find(f => /^(0000|0001|bg|background|dial)/i.test(f.path.split('/').pop() || ''))
+      || imageFiles.sort((a, b) => b.size - a.size)[0];
+
+    if (dialCandidate) {
+      const fileEntry = zip.files[dialCandidate.path];
+      if (fileEntry) {
+        previewBuffer = await fileEntry.async('arraybuffer');
+      }
+    }
+  }
+
+  if (previewBuffer && previewBuffer.byteLength > 0) {
+    const targetLocations = [
+      'preview.png',
+      'assets/preview.png',
+      'watchface/preview.png',
+      'idle/preview.png',
+      'idle/assets/preview.png'
+    ];
+    for (const loc of targetLocations) {
+      zip.file(loc, previewBuffer);
+    }
+    return true;
+  }
+
+  return false;
 }
 
 // Robust preview and asset media extractor across multiple JSZip archives
@@ -200,7 +564,7 @@ export async function extractManifestMetadata(zip: JSZip, rawBaseName: string): 
     if (manifestFile) {
       try {
         manifestOriginalStr = await manifestFile.async('string');
-        manifestJson = JSON.parse(manifestOriginalStr);
+        manifestJson = JSON.parse(stripBom(manifestOriginalStr));
 
         appName = manifestJson.app?.appName || manifestJson.name || rawBaseName;
         appId = manifestJson.app?.appId?.toString() || manifestJson.appId?.toString();
@@ -255,13 +619,13 @@ export function generateManifestDiagnostic(
   let patchedJson: any = null;
 
   try {
-    if (originalStr) originalJson = JSON.parse(originalStr);
+    if (originalStr) originalJson = JSON.parse(stripBom(originalStr));
   } catch {
     // Ignore JSON parse errors
   }
 
   try {
-    if (patchedStr) patchedJson = JSON.parse(patchedStr);
+    if (patchedStr) patchedJson = JSON.parse(stripBom(patchedStr));
   } catch {
     // Ignore JSON parse errors
   }
@@ -566,6 +930,7 @@ async function patchWatchfaceZip(
   extractedImages?: ExtractedImageItem[];
   packageInfo: PackageMetadata;
 }> {
+  await normalizeZipEntryPaths(zip);
   const allFilePaths = Object.keys(zip.files);
 
   // 1. Locate and extract Preview Images & Asset Media
@@ -581,7 +946,7 @@ async function patchWatchfaceZip(
   // 2. Locate Manifest and extract base metadata
   const baseMeta = await extractManifestMetadata(zip, rawBaseName);
   let manifestPath = baseMeta.manifestPath;
-  let manifestOriginalStr = baseMeta.manifestOriginalStr;
+  let manifestOriginalStr = baseMeta.manifestOriginalStr ? stripBom(baseMeta.manifestOriginalStr) : undefined;
   let manifestPatchedStr: string | undefined;
   let packageInfo: PackageMetadata = {
     ...baseMeta.packageInfo,
@@ -589,181 +954,30 @@ async function patchWatchfaceZip(
   };
 
   let manifestPatched = false;
+  let manifestJson: any = undefined;
   if (manifestPath && manifestOriginalStr) {
     try {
-      const manifestJson = JSON.parse(manifestOriginalStr);
+      manifestJson = JSON.parse(manifestOriginalStr);
       addLog('extract', `Parsed manifest "${manifestPath}" for app "${packageInfo.appName}" (v${packageInfo.version}) [${packageInfo.resolution || 'AMOLED'}]`);
 
-        if (options.syncManifestTargets) {
-          addLog('patch', `Applying Zepp OS Manifest FAOD Synchronization:`);
-
-          // 1) Handle modern nested targets: { "device-target": { "module": { "watchface": {...}, "idle": {...} }, "platforms": [...] } }
-          if (manifestJson.targets && typeof manifestJson.targets === 'object') {
-            const targetKeys = Object.keys(manifestJson.targets);
-            const isNestedTargetMap = targetKeys.some(k => 
-              typeof manifestJson.targets[k] === 'object' && 
-              manifestJson.targets[k] !== null && 
-              (manifestJson.targets[k].module || manifestJson.targets[k].platforms)
-            );
-
-            if (isNestedTargetMap) {
-              // Clean up any stale root 'idle' or 'watchface' string properties that might have corrupted targets map
-              if (typeof manifestJson.targets.idle === 'string') delete manifestJson.targets.idle;
-              if (typeof manifestJson.targets.watchface === 'string') delete manifestJson.targets.watchface;
-
-              for (const key of Object.keys(manifestJson.targets)) {
-                const targetObj = manifestJson.targets[key];
-                if (targetObj && typeof targetObj === 'object') {
-                  if (targetObj.module) {
-                    const wfMod = targetObj.module.watchface || { path: 'watchface/index' };
-                    targetObj.module.watchface = {
-                      ...wfMod,
-                      showInAod: true,
-                      secondHand: true
-                    };
-                    targetObj.module.idle = { 
-                      ...wfMod, 
-                      path: wfMod.path ? wfMod.path.replace(/^watchface\//, 'idle/').replace(/^page\/watchface\//, 'page/idle/') : 'idle/index',
-                      showInAod: true,
-                      secondHand: true,
-                      secondHandInAod: true
-                    };
-                    addLog('patch', ` -> Target "${key}": module.idle mapped to "${targetObj.module.idle.path}" (showInAod: true, secondHand: true)`);
-                  } else {
-                    targetObj.module = {
-                      watchface: { path: 'watchface/index', showInAod: true, secondHand: true },
-                      idle: { path: 'idle/index', showInAod: true, secondHand: true, secondHandInAod: true }
-                    };
-                  }
-                  targetObj.defaultAOD = true;
-                  targetObj.showInAod = true;
-                  targetObj.secondHand = true;
-                  targetObj.secondHandInAod = true;
-                  targetObj.apollo = {
-                    secondHand: true,
-                    secondHandInAod: true,
-                    defaultAOD: true
-                  };
-                }
-              }
-            } else {
-              // Flat targets structure: { "watchface": "watchface/index", "idle": "idle/index" }
-              manifestJson.targets.watchface = manifestJson.targets.watchface || 'watchface/index';
-              manifestJson.targets.idle = 'idle/index';
-              manifestJson.targets.showInAod = true;
-              manifestJson.targets.secondHand = true;
-              addLog('patch', ` -> Flat targets updated: watchface="watchface/index", idle="idle/index", showInAod=true, secondHand=true`);
-            }
-          } else {
-            // No targets defined, check if module exists at root
-            if (!manifestJson.module) {
-              manifestJson.module = {
-                watchface: { path: 'watchface/index', showInAod: true, secondHand: true },
-                idle: { path: 'idle/index', showInAod: true, secondHand: true }
-              };
-              addLog('patch', ` -> Synthesized root module mapping: watchface="watchface/index", idle="idle/index" (showInAod: true, secondHand: true)`);
-            }
-          }
-
-          // 2) Handle root module: { "watchface": { "path": "..." }, "idle": { "path": "..." } }
-          if (manifestJson.module && typeof manifestJson.module === 'object') {
-            if (manifestJson.module.watchface) {
-              const wfPath = manifestJson.module.watchface.path || 'watchface/index';
-              manifestJson.module.watchface = {
-                ...manifestJson.module.watchface,
-                showInAod: true,
-                secondHand: true
-              };
-              manifestJson.module.idle = {
-                ...manifestJson.module.watchface,
-                path: wfPath.replace(/^watchface\//, 'idle/').replace(/^page\/watchface\//, 'page/idle/') || 'idle/index',
-                showInAod: true,
-                secondHand: true
-              };
-              addLog('patch', ` -> Synchronized root module.idle with path "${manifestJson.module.idle.path}" (showInAod: true, secondHand: true)`);
-            } else if (manifestJson.module.idle) {
-              manifestJson.module.idle.path = 'idle/index';
-              manifestJson.module.idle.showInAod = true;
-              manifestJson.module.idle.secondHand = true;
-            }
-          }
-
-          // 3) Handle legacy app.idle / app.watchface
-          if (manifestJson.app && typeof manifestJson.app === 'object') {
-            manifestJson.app.showInAod = true;
-            manifestJson.app.secondHand = true;
-            if (manifestJson.app.watchface) {
-              manifestJson.app.idle = { 
-                ...manifestJson.app.watchface, 
-                path: 'idle/index',
-                showInAod: true,
-                secondHand: true 
-              };
-              addLog('patch', ` -> Synchronized app.idle with app.watchface (showInAod: true, secondHand: true)`);
-            } else if (manifestJson.app.idle) {
-              manifestJson.app.idle.showInAod = true;
-              manifestJson.app.idle.secondHand = true;
-            }
-          }
-
-          // 4) Root Level AOD & Second Hand Attributes
-          manifestJson.defaultAOD = true;
-          manifestJson.showInAod = true;
-          manifestJson.secondHand = true;
-          manifestJson.secondHandInAod = true;
-
-          // 5) AmazFaces & Zepp OS Device Source Compatibility
-          // Ensure valid appId and deviceSource to prevent AmazFaces "Device Mismatch" or transfer aborts
-          if (manifestJson.app && typeof manifestJson.app === 'object') {
-            if (!manifestJson.app.appId || typeof manifestJson.app.appId !== 'number') {
-              manifestJson.app.appId = typeof manifestJson.app.appId === 'string' && /^\d+$/.test(manifestJson.app.appId)
-                ? parseInt(manifestJson.app.appId, 10)
-                : 849201;
-            }
-          }
-
-          const existingDevices: string[] = Array.isArray(manifestJson.deviceSource)
-            ? manifestJson.deviceSource
-            : Array.isArray(manifestJson.app?.deviceSource)
-            ? manifestJson.app.deviceSource
-            : [];
-
-          // Popular Zepp OS devices (Balance, GTR 4, GTS 4, T-Rex 2/3/Ultra, Cheetah, Active, Bip 5, GTR 3)
-          const universalDevices = [
-            '0x00000079', // Amazfit Balance
-            '0x00000092', // Amazfit Balance 2
-            '0x00000062', // Amazfit GTR 4
-            '0x00000063', // Amazfit GTS 4
-            '0x0000007A', // Amazfit T-Rex Ultra
-            '0x0000007C', // Amazfit Cheetah (Round)
-            '0x00000085', // Amazfit Active
-            '0x0000008F', // Amazfit T-Rex 3
-            '0x0000005B', // Amazfit T-Rex 2
-            '0x00000050', // Amazfit GTR 3 Pro
-            '0x0000004F'  // Amazfit GTR 3
-          ];
-
-          // If no devices or only a single restricted device, expand to universal Zepp OS list
-          if (existingDevices.length === 0) {
-            manifestJson.deviceSource = universalDevices;
-          } else {
-            const merged = Array.from(new Set([...existingDevices, ...universalDevices]));
-            manifestJson.deviceSource = merged;
-          }
-
-          addLog('patch', ` -> Manifest injected: defaultAOD=true, showInAod=true, secondHand=true (AmazFaces compatible)`);
-
-          manifestPatchedStr = JSON.stringify(manifestJson, null, 2);
-          zip.file(manifestPath, manifestPatchedStr);
-          manifestPatched = true;
-          addLog('success', `Manifest patch committed cleanly to "${manifestPath}"`);
+      if (options.syncManifestTargets) {
+        addLog('patch', `Applying Zepp OS Manifest FAOD Synchronization:`);
+        const { repairedCount, summary } = modernizeManifestSchema(manifestJson);
+        for (const msg of summary) {
+          addLog('patch', ` -> ${msg}`);
         }
-      } catch (err) {
-        addLog('warn', `Could not parse manifest JSON: ${err}`);
+
+        manifestPatchedStr = JSON.stringify(manifestJson, null, 2);
+        zip.file(manifestPath, manifestPatchedStr);
+        manifestPatched = true;
+        addLog('success', `Manifest patch committed cleanly to "${manifestPath}" (${repairedCount} schema upgrades applied)`);
       }
-    } else {
-      addLog('warn', `No standard app.json or watchface.json found in archive root. Proceeding with directory and script patches.`);
+    } catch (err) {
+      addLog('warn', `Could not parse manifest JSON: ${err}`);
     }
+  } else {
+    addLog('warn', `No standard app.json or watchface.json found in archive root. Proceeding with directory and script patches.`);
+  }
 
   // 3. Idle Directory Overwrite & Simple AOD Override (Purge Minimal/Blank AOD)
   let idleFilesReplaced = 0;
@@ -834,67 +1048,16 @@ async function patchWatchfaceZip(
     }
   }
 
-  // 3B. Universal Image Asset Cross-Mirroring & Resolution Optimization
-  // Fixes missing images on Zepp OS firmwares (Root-relative vs Module-relative paths)
+  // 3B. Universal Image Asset Cross-Mirroring & Ubiquitous Preview Placement
   addLog('patch', `Optimizing and cross-mirroring graphic assets across all runtime folders...`);
-  const allCurrentPaths = Object.keys(zip.files);
-  const imageExtensions = /\.(png|jpg|jpeg|webp|bin|bmp|tga)$/i;
-
-  const imageAssetEntries: { fileName: string; sourcePath: string; buffer: ArrayBuffer }[] = [];
-  for (const p of allCurrentPaths) {
-    if (zip.file(p)?.dir) continue;
-    if (imageExtensions.test(p)) {
-      const parts = p.split('/');
-      const fileName = parts[parts.length - 1];
-      try {
-        const buffer = await zip.file(p)!.async('arraybuffer');
-        if (buffer.byteLength > 0) {
-          imageAssetEntries.push({ fileName, sourcePath: p, buffer });
-        }
-      } catch {}
-    }
-  }
-
-  let assetsCrossMirrored = 0;
-  const hasPageFolder = allCurrentPaths.some(p => p.startsWith('page/'));
-
-  for (const { fileName, buffer } of imageAssetEntries) {
-    const targetPaths = [
-      `assets/${fileName}`,
-      `watchface/assets/${fileName}`,
-      `idle/assets/${fileName}`
-    ];
-    if (hasPageFolder) {
-      targetPaths.push(`page/watchface/assets/${fileName}`);
-      targetPaths.push(`page/idle/assets/${fileName}`);
-    }
-
-    for (const tPath of targetPaths) {
-      if (!zip.file(tPath)) {
-        zip.file(tPath, buffer);
-        assetsCrossMirrored++;
-      }
-    }
-  }
-
-  // Auto-generate preview.png and idle/preview.png if missing from the primary dial candidate
-  const hasRootPreview = zip.file('preview.png') || zip.file('assets/preview.png') || zip.file('watchface/preview.png');
-  if (!hasRootPreview && imageAssetEntries.length > 0) {
-    const dialCandidate = imageAssetEntries.find(img => /^(0000|0001|bg|background|dial)/i.test(img.fileName)) ||
-      [...imageAssetEntries].sort((a, b) => b.buffer.byteLength - a.buffer.byteLength)[0];
-
-    if (dialCandidate) {
-      zip.file('preview.png', dialCandidate.buffer);
-      zip.file('assets/preview.png', dialCandidate.buffer);
-      zip.file('watchface/preview.png', dialCandidate.buffer);
-      zip.file('idle/preview.png', dialCandidate.buffer);
-      zip.file('idle/assets/preview.png', dialCandidate.buffer);
-      addLog('patch', `Auto-generated missing preview.png and AOD preview from dial texture "${dialCandidate.fileName}"`);
-    }
-  }
-
+  const assetsCrossMirrored = await mirrorAllGraphicAssets(zip);
   if (assetsCrossMirrored > 0) {
     addLog('success', `Universal asset cross-linking completed: ${assetsCrossMirrored} image asset instances mirrored across root and module folders.`);
+  }
+
+  const previewEnsured = await ensureUbiquitousPreview(zip, manifestJson);
+  if (previewEnsured) {
+    addLog('patch', `Guaranteed ubiquitous preview.png across all 5 runtime paths.`);
   }
 
   // 4. Power & Battery Scan Phase
@@ -1019,61 +1182,24 @@ async function patchWatchfaceZip(
         }
       }
 
-      // Pattern 4: Second Hand & 60-Second Refresh Bypass (Ensures second hand remains visible/sweeping in AOD)
+      // Pattern 4: AST Transformation & 1Hz FAOD Engine
       if (options.bypassIdleRefreshRate) {
-        // 4a. Unlock any second-pointer specific ONLY_NORMAL tags that might have been nested
-        const regexSecondNormal = /(second_[a-zA-Z0-9_]+\s*:\s*[^}]+vis_mode\s*:\s*[^,}]+)ONLY_NORMAL/g;
-        if (regexSecondNormal.test(modifiedText)) {
-          modifiedText = modifiedText.replace(regexSecondNormal, '$1ALL');
-          otherAodPatches++;
-          filePatchCount++;
-        }
+        try {
+          const astResult = transformWatchfaceScript(modifiedText, {
+            bypassIdleRefreshRate: options.bypassIdleRefreshRate,
+            freezeSecondHandsInAod: options.batteryOptimizations?.freezeSecondHandsInAod ?? false,
+            designWidth: manifestJson?.designWidth || 480,
+            designHeight: 480
+          });
 
-        // 4b. Ensure second_hand / second_pointer properties have show_in_aod: true & vis_mode: hmUI.vis_mode.ALL
-        if (/second_(path|centerX|centerY|posX|posY|angle|pointer|cover|src|startX|startY)|(?:second_hand)/i.test(modifiedText)) {
-          if (!modifiedText.includes('__second_hand_aod_unlocked__')) {
-            let pointerPatched = false;
-
-            // Strategy 1: Match TIME_POINTER widget creations (hmUI.widget.TIME_POINTER, widget.TIME_POINTER, or 'TIME_POINTER')
-            const timePointerRegex = /(createWidget\s*\(\s*(?:hmUI\.widget\.|widget\.)?TIME_POINTER\s*,\s*\{)([\s\S]*?)(\}\s*\))/g;
-            if (timePointerRegex.test(modifiedText)) {
-              modifiedText = modifiedText.replace(timePointerRegex, (match, prefix, body, suffix) => {
-                if (!body.includes('__second_hand_aod_unlocked__')) {
-                  pointerPatched = true;
-                  otherAodPatches++;
-                  filePatchCount++;
-                  return `${prefix} /* __second_hand_aod_unlocked__ */ show_in_aod: true, vis_mode: (typeof hmUI !== 'undefined' && hmUI.vis_mode ? hmUI.vis_mode.ALL : 0), ${body}${suffix}`;
-                }
-                return match;
-              });
-            }
-
-            // Strategy 2: Match any object literal or variable containing second_path, second_centerX, etc.
-            if (!pointerPatched) {
-              const secondPropRegex = /(second_(?:path|centerX|posX|pointer|cover|angle)\s*:\s*[^,}]+)/i;
-              if (secondPropRegex.test(modifiedText)) {
-                modifiedText = modifiedText.replace(
-                  secondPropRegex,
-                  `/* __second_hand_aod_unlocked__ */ show_in_aod: true, vis_mode: (typeof hmUI !== 'undefined' && hmUI.vis_mode ? hmUI.vis_mode.ALL : 0), $1`
-                );
-                filePatchCount++;
-                otherAodPatches++;
-                pointerPatched = true;
-              }
-            }
-
-            // Strategy 3: Catch WatchFace / Page lifecycle init in idle scripts
-            if (!pointerPatched && (filePath.startsWith('idle/') || filePath.startsWith('page/idle/'))) {
-              if (modifiedText.includes('initView()') || modifiedText.includes('init_view()')) {
-                modifiedText = modifiedText.replace(
-                  /(initView\s*\(\s*\)\s*\{|init_view\s*\(\s*\)\s*\{)/,
-                  `$1 /* __second_hand_aod_unlocked__ */ try { if (typeof hmUI !== 'undefined' && hmUI.setLayerScrolling) { hmUI.setLayerScrolling(true); } } catch(e){}`
-                );
-                filePatchCount++;
-                otherAodPatches++;
-              }
-            }
+          if (astResult.secondHandTransformed) {
+            modifiedText = astResult.code;
+            otherAodPatches++;
+            filePatchCount++;
+            addLog('patch', ` -> Successfully transformed second hand to 1Hz FAOD IMG needle & WIDGET_DELEGATE in "${filePath}".`);
           }
+        } catch (astErr) {
+          addLog('warn', `AST transformation fallback on "${filePath}": ${astErr}`);
         }
       }
 
@@ -1188,6 +1314,7 @@ export async function convertWatchfacePackage(
     addLog('extract', `Reading archive stream with JSZip engine...`);
     const arrayBuffer = await item.file.arrayBuffer();
     outerZip = await JSZip.loadAsync(arrayBuffer);
+    await normalizeZipEntryPaths(outerZip);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     addLog('error', `Failed to unpack archive. Ensure it is a valid .zpk or .zip file.`, msg);
@@ -1216,6 +1343,7 @@ export async function convertWatchfacePackage(
     try {
       const nestedBuffer = await outerZip.file(nestedZpkPath)!.async('arraybuffer');
       targetZipToPatch = await JSZip.loadAsync(nestedBuffer);
+      await normalizeZipEntryPaths(targetZipToPatch);
       addLog('extract', `Inner .zpk loaded with ${Object.keys(targetZipToPatch.files).length} files.`);
     } catch (err) {
       addLog('warn', `Could not parse inner .zpk as JSZip, falling back to direct patching: ${err}`);
@@ -1397,6 +1525,7 @@ export async function repatchAodManifestErrors(
   const sourceBlob = item.outputBlob || item.file;
   const outerZip = new JSZip();
   await outerZip.loadAsync(sourceBlob);
+  await normalizeZipEntryPaths(outerZip);
 
   // Check for nested .zpk inside .zip
   let hasNestedZpk = false;
@@ -1415,6 +1544,7 @@ export async function repatchAodManifestErrors(
       const zpkData = await zpkEntry.async('arraybuffer');
       targetZipToPatch = new JSZip();
       await targetZipToPatch.loadAsync(zpkData);
+      await normalizeZipEntryPaths(targetZipToPatch);
       addLog('extract', `Extracted nested package "${zpkEntryName}" for in-place manifest repair.`);
     }
   }
@@ -1444,7 +1574,7 @@ export async function repatchAodManifestErrors(
   if (manifestPath && manifestOriginalStr) {
     try {
       // Remove any UTF-8 BOM if present
-      const cleanJsonStr = manifestOriginalStr.replace(/^\uFEFF/, '');
+      const cleanJsonStr = stripBom(manifestOriginalStr);
       manifestJson = JSON.parse(cleanJsonStr);
       addLog('info', `Located manifest "${manifestPath}". Inspecting layer pointers...`);
     } catch {
@@ -1465,6 +1595,11 @@ export async function repatchAodManifestErrors(
 
   let repairedPointersCount = 0;
   const repairedItemsSummary: string[] = [];
+
+  // Apply modernizeManifestSchema
+  const modResult = modernizeManifestSchema(manifestJson);
+  repairedPointersCount += modResult.repairedCount;
+  repairedItemsSummary.push(...modResult.summary);
 
   // A. Root Apollo & AOD Flags
   if (manifestJson.defaultAOD !== true) {
@@ -1606,31 +1741,37 @@ export async function repatchAodManifestErrors(
     }
   }
 
-  // E. Idle Directory Layer Assets Check (Missing Layer File Prevention)
-  const allFilePaths = Object.keys(targetZipToPatch.files);
-  let wfPrefix = 'watchface/';
-  let idlePrefix = 'idle/';
-  if (!allFilePaths.some(p => p.startsWith('watchface/')) && allFilePaths.some(p => p.startsWith('page/watchface/'))) {
-    wfPrefix = 'page/watchface/';
-    idlePrefix = 'page/idle/';
+  // E. Graphic Asset Cross-Mirroring & Ubiquitous Preview Placement
+  const mirrored = await mirrorAllGraphicAssets(targetZipToPatch);
+  if (mirrored > 0) {
+    repairedPointersCount += mirrored;
+    repairedItemsSummary.push(`Mirrored ${mirrored} graphic assets into idle/assets/ and watchface/assets/`);
   }
+  await ensureUbiquitousPreview(targetZipToPatch, manifestJson);
 
-  const idleFiles = allFilePaths.filter(p => p.startsWith(idlePrefix) && !targetZipToPatch.file(p)?.dir);
-  const watchfaceFiles = allFilePaths.filter(p => p.startsWith(wfPrefix) && !targetZipToPatch.file(p)?.dir);
-
-  if (idleFiles.length === 0 && watchfaceFiles.length > 0) {
-    addLog('patch', `Detected missing idle layer assets. Mirroring ${watchfaceFiles.length} files from "${wfPrefix}" into "${idlePrefix}"...`);
-    for (const wfPath of watchfaceFiles) {
-      const fileEntry = targetZipToPatch.file(wfPath);
+  // E2. Transform JavaScript scripts for 1Hz FAOD compatibility
+  for (const filePath of Object.keys(targetZipToPatch.files)) {
+    if (filePath.endsWith('.js') && (filePath.startsWith('watchface/') || filePath.startsWith('idle/'))) {
+      const fileEntry = targetZipToPatch.file(filePath);
       if (fileEntry) {
-        const relativePath = wfPath.slice(wfPrefix.length);
-        const targetIdlePath = `${idlePrefix}${relativePath}`;
-        const content = await fileEntry.async('arraybuffer');
-        targetZipToPatch.file(targetIdlePath, content);
+        try {
+          const originalCode = await fileEntry.async('string');
+          const astResult = transformWatchfaceScript(originalCode, {
+            bypassIdleRefreshRate: true,
+            freezeSecondHandsInAod: false,
+            designWidth: manifestJson?.designWidth || 480,
+            designHeight: 480
+          });
+          if (astResult.secondHandTransformed) {
+            targetZipToPatch.file(filePath, astResult.code);
+            repairedPointersCount++;
+            repairedItemsSummary.push(`Transformed second pointer in "${filePath}" to 1Hz FAOD IMG needle`);
+          }
+        } catch (scriptErr) {
+          addLog('warn', `Could not transform script "${filePath}": ${scriptErr}`);
+        }
       }
     }
-    repairedPointersCount += watchfaceFiles.length;
-    repairedItemsSummary.push(`Mirrored ${watchfaceFiles.length} layer files into "${idlePrefix}"`);
   }
 
   // Write patched manifest back to zip
@@ -1715,7 +1856,7 @@ export async function repatchAodManifestErrors(
 
   const stats: ConversionStats = {
     manifestPatched: true,
-    idleFilesReplaced: idleFiles.length === 0 ? watchfaceFiles.length : 0,
+    idleFilesReplaced: mirrored,
     scriptFilesModified: 1,
     tokensReplaced: {
       onlyNormalToAll: item.stats?.tokensReplaced?.onlyNormalToAll || 0,

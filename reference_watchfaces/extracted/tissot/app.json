@@ -1,0 +1,119 @@
+{
+  "configVersion": "v2",
+  "app": {
+    "appId": 481958,
+    "appName": "Tissot PRX",
+    "appType": "watchface",
+    "version": {
+      "code": 2,
+      "name": "1.0"
+    },
+    "icon": "0001.png",
+    "cover": [
+      "0001.png"
+    ],
+    "vender": "huami",
+    "description": "息屏表盘2",
+    "showInAod": true,
+    "secondHand": true
+  },
+  "permissions": [
+    "gps"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "1.0.0",
+      "target": "1.0.1",
+      "minVersion": "1.0.0"
+    }
+  },
+  "device": {
+    "targets": [
+      "gts"
+    ],
+    "platforms": [
+      {
+        "name": "Amazfit Balance",
+        "deviceSource": 8519936
+      },
+      {
+        "name": "Amazfit Balance",
+        "deviceSource": 8519937
+      },
+      {
+        "name": "Amazfit Balance",
+        "deviceSource": 8519939
+      }
+    ]
+  },
+  "module": {
+    "page": {
+      "pages": [
+        "pages/index"
+      ],
+      "window": {
+        "navigationBarBackgroundColor": "#ffffff",
+        "navigationBarTextStyle": "black",
+        "navigationBarTitleText": "倒计时",
+        "backgroundColor": "#eeeeee",
+        "backgroundTextStyle": "light"
+      }
+    },
+    "app-widget": {
+      "widgets": [
+        "app-widget/index"
+      ]
+    },
+    "watch-widget": {
+      "widgets": []
+    },
+    "watchface": {
+      "path": "watchface/index",
+      "main": 1,
+      "editable": 0,
+      "lockscreen": 1,
+      "hightCost": 0,
+      "showInAod": true,
+      "secondHand": true
+    },
+    "app-side": {
+      "path": "app-side/index"
+    },
+    "setting": {
+      "path": "setting/index"
+    },
+    "idle": {
+      "path": "idle/index",
+      "main": 1,
+      "editable": 0,
+      "lockscreen": 1,
+      "hightCost": 0,
+      "showInAod": true,
+      "secondHand": true
+    }
+  },
+  "i18n": {
+    "en-US": {
+      "name": "zepp"
+    }
+  },
+  "defaultLanguage": "en-US",
+  "designWidth": 480,
+  "defaultAOD": true,
+  "showInAod": true,
+  "secondHand": true,
+  "secondHandInAod": true,
+  "deviceSource": [
+    "0x00000079",
+    "0x00000092",
+    "0x00000062",
+    "0x00000063",
+    "0x0000007A",
+    "0x0000007C",
+    "0x00000085",
+    "0x0000008F",
+    "0x0000005B",
+    "0x00000050",
+    "0x0000004F"
+  ]
+}

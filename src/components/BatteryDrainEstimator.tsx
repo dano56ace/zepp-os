@@ -27,6 +27,7 @@ import {
   Filter
 } from 'lucide-react';
 import { PowerAnalysisReport, AodElementDrainItem, DrainSeverity, PowerProfileMode, WatchfaceFileItem } from '../types';
+import { getDeviceHardware, DEVICE_BATTERY_PROFILES, OPR_SAFE_THRESHOLD } from '../utils/batteryEstimator';
 
 interface BatteryDrainEstimatorProps {
   report?: PowerAnalysisReport;
@@ -45,11 +46,28 @@ export const BatteryDrainEstimator: React.FC<BatteryDrainEstimatorProps> = ({
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [severityFilter, setSeverityFilter] = useState<'all' | 'critical' | 'high_medium' | 'low_zero'>('all');
   const [sortBy, setSortBy] = useState<'drain' | 'name' | 'impact'>('drain');
-  const [batteryCapacityMah, setBatteryCapacityMah] = useState<number>(450); // Amazfit Balance standard ~450mAh
+
+  const initialHardware = useMemo(() => {
+    return getDeviceHardware(item?.packageInfo?.deviceSource?.[0] || '0x00000079');
+  }, [item]);
+  const [batteryCapacityMah, setBatteryCapacityMah] = useState<number>(initialHardware.batteryCapacityMah);
+
+  React.useEffect(() => {
+    setBatteryCapacityMah(initialHardware.batteryCapacityMah);
+  }, [initialHardware]);
 
   const report = useMemo(() => {
     return initialReport || item?.powerReport;
   }, [initialReport, item]);
+
+  const displayOprPercent = useMemo(() => {
+    const oledItem = report?.elementBreakdown?.find(e => e.category === 'oled_pixels');
+    if (oledItem?.stockBehavior) {
+      const match = oledItem.stockBehavior.match(/([0-9.]+)%/);
+      if (match) return `${match[1]}%`;
+    }
+    return oledItem?.drainPercentage ? `${(oledItem.drainPercentage * 10).toFixed(1)}%` : '8.5%';
+  }, [report]);
 
   // Fallback items if none provided
   const elementItems: AodElementDrainItem[] = useMemo(() => {
@@ -291,12 +309,15 @@ export const BatteryDrainEstimator: React.FC<BatteryDrainEstimatorProps> = ({
               <BatteryCharging className="w-6 h-6 animate-pulse" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h3 className="text-base font-bold text-white tracking-wide">
                   FAOD Battery Drain Estimation
                 </h3>
                 <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-500/40 font-mono font-bold">
                   Zepp OS 2.5/3.0
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-950 text-blue-300 border border-blue-500/40 font-mono font-bold">
+                  {initialHardware.deviceName} ({batteryCapacityMah} mAh)
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
@@ -678,7 +699,7 @@ export const BatteryDrainEstimator: React.FC<BatteryDrainEstimatorProps> = ({
         <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
           <div className="px-3 py-1.5 rounded-lg bg-[#14171e] border border-[#2d3139] text-center">
             <span className="text-[9px] text-slate-500 uppercase block">OPR Luminous Area</span>
-            <span className="font-mono text-emerald-400 font-bold text-xs">9.4% (Safe &lt; 15%)</span>
+            <span className="font-mono text-emerald-400 font-bold text-xs">{displayOprPercent} (Safe &lt; 15%)</span>
           </div>
           <div className="px-3 py-1.5 rounded-lg bg-[#14171e] border border-[#2d3139] text-center">
             <span className="text-[9px] text-slate-500 uppercase block">Pixel Shift</span>

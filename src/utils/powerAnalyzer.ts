@@ -7,6 +7,20 @@ import {
   PackageMetadata,
   AodElementDrainItem
 } from '../types';
+import {
+  calculateDialAssetMetrics,
+  calculateOledCurrent,
+  calculateDeviceBatteryProfile,
+  getDeviceHardware,
+  estimateWatchfacePower,
+  DEVICE_BATTERY_PROFILES,
+  BASE_STANDBY_CURRENT_MA,
+  CPU_1HZ_TICK_CURRENT_MA,
+  CPU_1MIN_TICK_CURRENT_MA,
+  OPR_SAFE_THRESHOLD
+} from './batteryEstimator';
+
+export { estimateWatchfacePower, calculateDialAssetMetrics, calculateOledCurrent, DEVICE_BATTERY_PROFILES };
 
 export interface ScanFinding {
   type: 'critical' | 'warning' | 'info' | 'optimized';
@@ -24,7 +38,7 @@ export interface ScanFinding {
 export function analyzeWatchfacePower(
   files: { [path: string]: string },
   filePaths: string[],
-  packageInfo: PackageMetadata,
+  packageInfo?: Partial<PackageMetadata>,
   mode: PowerProfileMode = 'balanced'
 ): PowerAnalysisReport {
   const findings: ScanFinding[] = [];
@@ -90,11 +104,18 @@ export function analyzeWatchfacePower(
     }
   }
 
-  // Check image assets
-  const imageAssets = filePaths.filter(p => /\.(png|jpg|jpeg|bin)$/i.test(p));
-  if (imageAssets.length > 25) {
+  // Check dial asset metrics and OPR
+  const dialMetrics = calculateDialAssetMetrics(files, filePaths, packageInfo as PackageMetadata);
+  if (!dialMetrics.isDarkDial || dialMetrics.totalAssets > 25) {
     hasLargeBackgroundImages = true;
   }
+
+  const targetDevSource = packageInfo?.deviceSource?.[0] || '0x00000079';
+  const targetHw = getDeviceHardware(targetDevSource);
+  const batteryCapacityMah = targetHw.batteryCapacityMah;
+
+  const oledCurrentMa = calculateOledCurrent(dialMetrics.estimatedOpr, dialMetrics.averageLuminance);
+  const secondCurrentMa = hasContinuousSecondsTimer ? CPU_1HZ_TICK_CURRENT_MA : CPU_1MIN_TICK_CURRENT_MA;
 
   // Calculate findings
   if (hasContinuousSecondsTimer) {
@@ -181,7 +202,7 @@ export function analyzeWatchfacePower(
     optimizedDrainPerHour = Math.max(0.9, baseDrainPerHour * 0.85);
   }
 
-  // Estimated battery life (assuming 450mAh battery on Amazfit Balance/GTR 4, ~100% capacity)
+  // Estimated battery life (100% capacity / (drain%/hr * 24hr))
   const stockBatteryDays = (100 / (baseDrainPerHour * 24)).toFixed(1);
   const optimizedBatteryDays = (100 / (optimizedDrainPerHour * 24)).toFixed(1);
 
@@ -196,7 +217,7 @@ export function analyzeWatchfacePower(
       name: '1Hz Analog Second Hand / Rapid Ticker',
       category: 'second_hand',
       impactLevel: hasContinuousSecondsTimer ? 'critical' : (hasHighFreqInterval ? 'high' : 'low'),
-      drainPercentage: hasContinuousSecondsTimer ? 1.8 : (hasHighFreqInterval ? 1.4 : 0.08),
+      drainPercentage: Number(((secondCurrentMa / batteryCapacityMah) * 100).toFixed(2)),
       drainSharePercent: 0,
       stockBehavior: hasContinuousSecondsTimer 
         ? 'Unconstrained 1-second CPU timer waking MCU & display controller continuously (60 wakes/min)'
@@ -206,7 +227,7 @@ export function analyzeWatchfacePower(
         : 'Smart 1Hz/1-min Apollo co-processor eco tick; hardware sleeps between steps',
       isOptimizedInFaod: hasContinuousSecondsTimer || hasHighFreqInterval,
       statusBadge: hasContinuousSecondsTimer ? '1-Min Standby Throttled' : 'Ultra-Low Drain',
-      estimatedMaCurrent: hasContinuousSecondsTimer ? 8.2 : 0.4,
+      estimatedMaCurrent: secondCurrentMa,
       mitigationTip: 'Throttling pointer updates in AOD eliminates up to 3,540 unnecessary CPU wakes per hour.'
     },
     {
@@ -263,16 +284,14 @@ export function analyzeWatchfacePower(
       id: 'elem-oled-pixels',
       name: 'AMOLED Active Pixel Luminous Ratio (OPR)',
       category: 'oled_pixels',
-      impactLevel: hasLargeBackgroundImages ? 'medium' : 'low',
-      drainPercentage: hasLargeBackgroundImages ? 0.65 : 0.32,
+      impactLevel: dialMetrics.estimatedOpr > OPR_SAFE_THRESHOLD ? 'high' : 'low',
+      drainPercentage: Number(((oledCurrentMa / batteryCapacityMah) * 100).toFixed(2)),
       drainSharePercent: 0,
-      stockBehavior: hasLargeBackgroundImages
-        ? 'High pixel luminance dial background with non-zero color channels across display surface'
-        : 'Moderate contrast dial graphics with standard luminance',
+      stockBehavior: `Active luminous area: ${(dialMetrics.estimatedOpr * 100).toFixed(1)}% (OPR)`,
       faodBehavior: 'Optimized high-contrast black backdrop; unneeded sub-pixels turned completely off',
       isOptimizedInFaod: true,
-      statusBadge: 'OLED Sub-Pixel Eco',
-      estimatedMaCurrent: hasLargeBackgroundImages ? 3.0 : 1.4,
+      statusBadge: dialMetrics.isDarkDial ? 'Safe < 15%' : 'High Luminance',
+      estimatedMaCurrent: Number(oledCurrentMa.toFixed(2)),
       mitigationTip: 'OLED diodes draw 0 mA for black pixels (#000000). High contrast designs maximize battery runtime.'
     },
     {
@@ -280,13 +299,13 @@ export function analyzeWatchfacePower(
       name: 'Apollo Low-Power Timekeeping Engine',
       category: 'clock_core',
       impactLevel: 'low',
-      drainPercentage: 0.22,
+      drainPercentage: Number(((BASE_STANDBY_CURRENT_MA / batteryCapacityMah) * 100).toFixed(2)),
       drainSharePercent: 0,
       stockBehavior: 'Standard 1-minute atomic time clock interrupt',
       faodBehavior: 'Ultra-low-power Apollo 4 co-processor hardware timer loop',
       isOptimizedInFaod: true,
       statusBadge: 'Apollo 1-Min Core',
-      estimatedMaCurrent: 0.95,
+      estimatedMaCurrent: BASE_STANDBY_CURRENT_MA,
       mitigationTip: 'Baseline energy floor required for crystal oscillator and hardware time registers.'
     },
     {
