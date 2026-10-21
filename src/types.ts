@@ -104,6 +104,17 @@ export interface ExtractedImageItem {
   isDialCandidate?: boolean;
 }
 
+export interface CompatibilityMetadata {
+  sdkVersion: '1.0' | '2.0' | '3.x';
+  bundlerType: 'standard' | 'minified' | 'webpack';
+  polyfillsInjected: boolean;
+  nativeWidth: number;
+  nativeHeight: number;
+  screenShape: 'round' | 'square' | 'rectangle';
+  aliasedWidgetsResolved: number;
+  universalDevicesRegistered: number;
+}
+
 export interface PackageMetadata {
   appId?: string;
   appName?: string;
@@ -119,6 +130,7 @@ export interface PackageMetadata {
   resolution?: string;
   author?: string;
   description?: string;
+  compatibility?: CompatibilityMetadata;
 }
 
 export interface ManifestDiagnosticItem {
@@ -127,7 +139,7 @@ export interface ManifestDiagnosticItem {
   originalValue: any;
   patchedValue: any;
   status: 'injected' | 'modified' | 'verified_true' | 'preserved' | 'missing';
-  category: 'showInAod' | 'secondHand' | 'target_sync' | 'module_mapping' | 'general';
+  category: 'showInAod' | 'secondHand' | 'target_sync' | 'module_mapping' | 'compatibility' | 'general';
   description: string;
 }
 
@@ -159,7 +171,12 @@ export interface ManifestDiagnosticResult {
     secondHandUnfrozen: boolean;
     visModePatchedCount: number;
     showInAodScriptCount: number;
+    sdkVersion?: '1.0' | '2.0' | '3.x';
+    bundlerType?: 'standard' | 'minified' | 'webpack';
+    polyfillsInjected?: boolean;
+    aliasedWidgetsResolved?: number;
   };
+  compatibility?: CompatibilityMetadata;
   overallHealth: 'passed' | 'warning' | 'error';
 }
 
@@ -202,6 +219,8 @@ export interface ConversionOptions {
   patchScriptVisibility: boolean;
   deepWidgetVisibilityPatch: boolean;
   bypassIdleRefreshRate: boolean; // Overrides Zepp OS second hand & AOD timer suppression
+  injectZosPolyfills?: boolean; // Auto-inject Zepp OS 1.0 to 3.x API shims (@zos/* <-> hmUI/hmSensor)
+  preserveNativeResolution?: boolean; // Preserve native designWidth and screen dimensions without stretching
   autoDownload: boolean;
   compressionLevel: number;
   outputNaming: OutputNamingMode;
@@ -228,6 +247,8 @@ export const DEFAULT_CONVERSION_OPTIONS: ConversionOptions = {
   patchScriptVisibility: true,
   deepWidgetVisibilityPatch: true,
   bypassIdleRefreshRate: true, // Default to true so all optimized watchfaces bypass 60s second-hand suppression
+  injectZosPolyfills: true,
+  preserveNativeResolution: true,
   autoDownload: false, // Do not download automatically; user clicks download button
   compressionLevel: 9,
   outputNaming: 'original',

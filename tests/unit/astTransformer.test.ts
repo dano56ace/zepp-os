@@ -313,5 +313,49 @@ describe('Milestone 3: AST Transformation & 1Hz FAOD Engine', () => {
     expect(result.code).toContain('secText.setProperty(hmUI.prop.TEXT, __secStr__)');
     expect(result.code).toContain('setInterval(__faodUpdateSecondHand__, 1000)');
   });
+
+  it('Compatibility: Zepp OS 3.x (@zos/ui & @zos/sensor) watchface injects polyfill after imports and transforms TIME_POINTER', () => {
+    const zos3Script = `import { createWidget, widget, show_level, prop } from '@zos/ui';
+import { Time } from '@zos/sensor';
+
+WatchFace({
+  build() {
+    const secHand = createWidget(widget.TIME_POINTER, {
+      second_path: 'sec_zos3.png',
+      second_centerX: 233,
+      second_centerY: 233,
+      second_posX: 15,
+      second_posY: 200,
+      show_level: show_level.ONLY_NORMAL
+    });
+  }
+});`;
+
+    const result = transformWatchfaceScript(zos3Script, { designWidth: 466, designHeight: 466 });
+    expect(result.sdkVersionDetected).toBe('3.x');
+    expect(result.polyfillsInjected).toBe(true);
+    expect(result.secondHandTransformed).toBe(true);
+    expect(result.delegateInjected).toBe(true);
+    // Ensure ES imports stay at the very top of the file before the polyfill shim
+    expect(result.code.trim().startsWith("import { createWidget")).toBe(true);
+    expect(result.code).toContain('__ZOS_UNIVERSAL_COMPAT_SHIM__');
+    expect(result.code).toContain('createWidget(widget.IMG');
+    expect(result.code).toContain('w: 466');
+    expect(result.code).toContain('h: 466');
+  });
+
+  it('Compatibility: Minified / Webpack-bundled watchface with aliased _ui namespace transforms second pointer accurately', () => {
+    const minifiedScript = `!function(e){var _ui=hmUI;WatchFace({init_view:function(){var s=_ui.createWidget(_ui.widget.TIME_POINTER,{second_path:"s.png",second_centerX:195,second_centerY:225,second_posX:10,second_posY:180,show_level:_ui.show_level.ONLY_NORMAL})}})}();`;
+
+    const result = transformWatchfaceScript(minifiedScript, { designWidth: 390, designHeight: 450 });
+    expect(result.bundlerType).toBe('minified');
+    expect(result.aliasedWidgetsResolved).toBeGreaterThanOrEqual(1);
+    expect(result.secondHandTransformed).toBe(true);
+    expect(result.delegateInjected).toBe(true);
+    expect(result.code).toContain('_ui.createWidget(_ui.widget.IMG');
+    expect(result.code).toContain('pos_x: 185');
+    expect(result.code).toContain('pos_y: 45');
+  });
 });
+
 

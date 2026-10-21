@@ -541,13 +541,30 @@ export const QueueList: React.FC<QueueListProps> = ({
                     />
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#94a3b8] mt-1.5">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#94a3b8] mt-1.5 font-mono tabular-nums">
                     <span>{(item.size / 1024).toFixed(1)} KB</span>
                     
+                    {item.packageInfo?.compatibility && (
+                      <>
+                        <span className="text-[#475569]">•</span>
+                        <span className="px-1.5 py-0.2 rounded bg-cyan-950/60 text-cyan-300 border border-cyan-800/50 text-[10px] font-bold">
+                          Zepp OS {item.packageInfo.compatibility.sdkVersion}
+                        </span>
+                        <span className="px-1.5 py-0.2 rounded bg-[#0f1115] text-slate-300 border border-[#2d3139] text-[10px]">
+                          {item.packageInfo.compatibility.nativeWidth}×{item.packageInfo.compatibility.nativeHeight}
+                        </span>
+                        {item.packageInfo.compatibility.bundlerType !== 'standard' && (
+                          <span className="px-1.5 py-0.2 rounded bg-amber-950/60 text-amber-300 border border-amber-800/50 text-[10px] uppercase">
+                            {item.packageInfo.compatibility.bundlerType}
+                          </span>
+                        )}
+                      </>
+                    )}
+
                     {item.packageInfo?.deviceSourceNames && item.packageInfo.deviceSourceNames.length > 0 && (
                       <>
                         <span className="text-[#475569]">•</span>
-                        <span className="text-blue-400 font-medium">
+                        <span className="text-blue-400 font-sans font-medium">
                           {item.packageInfo.deviceSourceNames[0]}
                         </span>
                       </>
@@ -556,7 +573,7 @@ export const QueueList: React.FC<QueueListProps> = ({
                     {item.stats && (
                       <>
                         <span className="text-[#475569]">•</span>
-                        <span className="text-emerald-400">
+                        <span className="text-emerald-400 font-sans">
                           {item.stats.tokensReplaced.onlyNormalToAll + item.stats.tokensReplaced.showInAodToTrue + item.stats.tokensReplaced.otherAodPatches} AOD flags unlocked
                         </span>
                       </>
@@ -565,7 +582,7 @@ export const QueueList: React.FC<QueueListProps> = ({
                     {item.powerReport && (
                       <>
                         <span className="text-[#475569]">•</span>
-                        <span className="text-blue-300">
+                        <span className="text-blue-300 font-sans">
                           Score: {item.powerReport.optimizedEfficiencyScore}/100 (~{item.powerReport.estimatedOptimizedDays})
                         </span>
                       </>
@@ -583,7 +600,7 @@ export const QueueList: React.FC<QueueListProps> = ({
                     {item.stats && item.stats.idleFilesReplaced > 0 && (
                       <>
                         <span className="text-[#475569]">•</span>
-                        <span className="text-purple-300 font-medium flex items-center gap-1">
+                        <span className="text-purple-300 font-sans font-medium flex items-center gap-1">
                           <FolderSync className="w-3 h-3 text-purple-400 inline" />
                           <span>Simple AOD Overridden ({item.stats.idleFilesReplaced} files)</span>
                         </span>

@@ -10,11 +10,11 @@ export interface WatchModelPreset {
 }
 
 export const WATCH_PRESETS: WatchModelPreset[] = [
-  { id: 'universal', name: 'Universal Zepp OS', resolution: 'Auto-Detect', shape: 'All Devices', category: 'Universal' },
-  { id: 'balance-2', name: 'Amazfit Balance / 2', resolution: '480×480', shape: 'Round', category: 'Popular' },
-  { id: 'gtr-4', name: 'Amazfit GTR 4', resolution: '466×466', shape: 'Round', category: 'Popular' },
-  { id: 'trex-3', name: 'Amazfit T-Rex 3 / Ultra', resolution: '480×480', shape: 'Round', category: 'Rugged' },
-  { id: 'gts-4', name: 'Amazfit GTS 4 / Active', resolution: '390×450', shape: 'Square', category: 'Square' },
+  { id: 'universal', name: 'Universal Zepp OS (17+ Models)', resolution: 'Native Auto', shape: 'Round & Square', category: 'Universal' },
+  { id: 'balance-2', name: 'Amazfit Balance / 2 / GTR 3 Pro', resolution: '480×480', shape: 'Round', category: 'Popular' },
+  { id: 'gtr-4', name: 'Amazfit GTR 4 / Active 2', resolution: '466×466', shape: 'Round', category: 'Popular' },
+  { id: 'trex-3', name: 'Amazfit T-Rex 3 / Ultra / GTR 3', resolution: '480 / 454', shape: 'Round', category: 'Rugged' },
+  { id: 'gts-4', name: 'Amazfit GTS 4 / Active / Bip 5', resolution: '390×450 / Sq', shape: 'Square', category: 'Square' },
 ];
 
 interface DeviceSelectorProps {

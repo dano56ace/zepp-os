@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { PowerAnalysisReport, AodElementDrainItem, DrainSeverity, PowerProfileMode, WatchfaceFileItem } from '../types';
 import { getDeviceHardware, DEVICE_BATTERY_PROFILES, OPR_SAFE_THRESHOLD } from '../utils/batteryEstimator';
+import { PowerConsumptionChart } from './PowerConsumptionChart';
 
 interface BatteryDrainEstimatorProps {
   report?: PowerAnalysisReport;
@@ -517,6 +518,13 @@ export const BatteryDrainEstimator: React.FC<BatteryDrainEstimatorProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Recharts Interactive Visualizer for Power Consumption & AOD Impact */}
+      <PowerConsumptionChart 
+        report={report} 
+        item={item} 
+        activeProfile={activeProfile} 
+      />
 
       {/* Filter and Search Bar for Elements Breakdown */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 px-1">

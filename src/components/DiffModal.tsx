@@ -275,6 +275,41 @@ export const DiffModal: React.FC<DiffModalProps> = ({ item, onClose }) => {
                 </div>
               </div>
 
+              {/* Universal Compatibility Matrix Row */}
+              <div className="p-4 rounded-xl bg-[#0f1115] border border-cyan-500/30 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[11px] uppercase font-bold text-cyan-400 flex items-center gap-1.5">
+                    <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                    <span>Universal Watchface Compatibility Matrix (Zepp OS 1.0 ↔ 2.0 ↔ 3.x)</span>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold uppercase bg-cyan-950 text-cyan-300 border border-cyan-800">
+                    {item.packageInfo?.compatibility?.polyfillsInjected ? 'POLYFILLS ACTIVE' : 'COMPATIBLE'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[11px]">
+                  <div className="p-2.5 rounded-lg bg-[#16191f] border border-[#2d3139] flex items-center justify-between">
+                    <span className="text-[#94a3b8]">Detected SDK Generation</span>
+                    <span className="font-mono font-bold text-cyan-300 tabular-nums">
+                      Zepp OS {item.packageInfo?.compatibility?.sdkVersion || '1.0'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-[#16191f] border border-[#2d3139] flex items-center justify-between">
+                    <span className="text-[#94a3b8]">Script Bundler Format</span>
+                    <span className="font-mono font-bold text-white uppercase tabular-nums">
+                      {item.packageInfo?.compatibility?.bundlerType || 'standard'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-[#16191f] border border-[#2d3139] flex items-center justify-between">
+                    <span className="text-[#94a3b8]">Native Display Geometry</span>
+                    <span className="font-mono font-bold text-emerald-300 tabular-nums">
+                      {item.packageInfo?.compatibility
+                        ? `${item.packageInfo.compatibility.nativeWidth}×${item.packageInfo.compatibility.nativeHeight} (${item.packageInfo.compatibility.screenShape})`
+                        : item.packageInfo?.resolution || '480×480'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               {/* Filtering and Search Controls */}
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-2">
                 <div className="flex items-center gap-2">

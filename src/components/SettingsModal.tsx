@@ -251,6 +251,47 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Setting 0B: Zepp OS 1.0 - 3.x API Polyfill Shims */}
+          <div className="flex items-start justify-between gap-4 p-3.5 rounded-lg bg-[#0f1115] border border-cyan-500/40">
+            <div className="space-y-1">
+              <div className="font-semibold text-white flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                <span>Auto-Inject Zepp OS 1.0–3.x API Shims</span>
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-800/60 font-bold uppercase font-mono">
+                  v1.0 ↔ v3.x
+                </span>
+              </div>
+              <p className="text-[#94a3b8] leading-relaxed">
+                Bridges modular <code className="text-cyan-300 font-mono">@zos/ui</code> & <code className="text-cyan-300 font-mono">@zos/sensor</code> imports with legacy <code className="text-cyan-300 font-mono">hmUI</code>/<code className="text-cyan-300 font-mono">hmSensor</code> globals and resolves minified/Webpack-bundled widget calls.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={options.injectZosPolyfills ?? true}
+              onChange={(e) => onChange({ ...options, injectZosPolyfills: e.target.checked })}
+              className="mt-1 rounded border-[#2d3139] text-cyan-500 focus:ring-cyan-500 bg-[#16191f] w-4 h-4 cursor-pointer"
+            />
+          </div>
+
+          {/* Setting 0C: Preserve Native Resolution */}
+          <div className="flex items-start justify-between gap-4 p-3.5 rounded-lg bg-[#0f1115] border border-[#2d3139]">
+            <div className="space-y-1">
+              <div className="font-semibold text-white flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-blue-400" />
+                <span>Preserve Native Resolution & Aspect Ratio</span>
+              </div>
+              <p className="text-[#94a3b8] leading-relaxed">
+                Retains native <code className="text-blue-300 font-mono">designWidth</code> (e.g. 480×480, 466×466, 454×454, 390×450 square) and calculates exact needle pivots without stretching.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={options.preserveNativeResolution ?? true}
+              onChange={(e) => onChange({ ...options, preserveNativeResolution: e.target.checked })}
+              className="mt-1 rounded border-[#2d3139] text-blue-600 focus:ring-blue-500 bg-[#16191f] w-4 h-4 cursor-pointer"
+            />
+          </div>
+
           {/* Setting 1: Manifest target sync */}
           <div className="flex items-start justify-between gap-4 p-3.5 rounded-lg bg-[#0f1115] border border-[#2d3139]">
             <div className="space-y-1">

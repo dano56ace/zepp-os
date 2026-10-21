@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { 
+  CompatibilityMetadata,
   ConversionOptions, 
   ConversionStats, 
   EnergyOptimizationStats, 
@@ -13,7 +14,11 @@ import {
 } from '../types.ts';
 import { resolveDeviceDetails, resolveDeviceNames } from './devices.ts';
 import { analyzeWatchfacePower, applyBatteryOptimizations } from './powerAnalyzer.ts';
-import { transformWatchfaceScript } from './astTransformer.ts';
+import { 
+  transformWatchfaceScript, 
+  detectScriptCompatibility, 
+  injectZosCompatibilityPolyfill 
+} from './astTransformer.ts';
 
 export function createLog(
   level: LogMessage['level'],
@@ -78,6 +83,12 @@ export const UNIVERSAL_TARGET_DEVICES: DeviceTargetSpec[] = [
   { hex: '0x00000073', name: 'Amazfit T-Rex Ultra', deviceSource: 115 },
   { hex: '0x00000078', name: 'Amazfit Active', deviceSource: 120 },
   { hex: '0x0000007A', name: 'Amazfit Active Edge', deviceSource: 122 },
+  { hex: '0x0000008F', name: 'Amazfit T-Rex 3', deviceSource: 143 },
+  { hex: '0x00000092', name: 'Amazfit Balance 2', deviceSource: 146 },
+  { hex: '0x00000063', name: 'Amazfit GTS 4', deviceSource: 99 },
+  { hex: '0x00000064', name: 'Amazfit GTS 4 Mini', deviceSource: 100 },
+  { hex: '0x00000088', name: 'Amazfit Bip 5', deviceSource: 136 },
+  { hex: '0x00000095', name: 'Amazfit Active 2', deviceSource: 149 },
 ];
 
 export interface ManifestModernizationResult {
@@ -85,7 +96,10 @@ export interface ManifestModernizationResult {
   summary: string[];
 }
 
-export function modernizeManifestSchema(manifestJson: any): ManifestModernizationResult {
+export function modernizeManifestSchema(
+  manifestJson: any,
+  options?: { preserveNativeResolution?: boolean }
+): ManifestModernizationResult {
   let repairedCount = 0;
   const summary: string[] = [];
 
@@ -96,8 +110,11 @@ export function modernizeManifestSchema(manifestJson: any): ManifestModernizatio
     summary.push('Migrated configVersion to "v2"');
   }
 
-  // 2. Enforce designWidth: 480
-  if (typeof manifestJson.designWidth !== 'number' || manifestJson.designWidth <= 0) {
+  // 2. Preserve native designWidth if valid and preserveNativeResolution !== false; otherwise default to 480
+  const preserveRes = options?.preserveNativeResolution !== false;
+  if (typeof manifestJson.designWidth === 'number' && manifestJson.designWidth > 0 && preserveRes) {
+    summary.push(`Preserved native "designWidth": ${manifestJson.designWidth}`);
+  } else if (typeof manifestJson.designWidth !== 'number' || manifestJson.designWidth <= 0) {
     manifestJson.designWidth = 480;
     repairedCount++;
     summary.push('Injected "designWidth": 480');
@@ -577,12 +594,29 @@ export async function extractManifestMetadata(zip: JSZip, rawBaseName: string): 
         const rawDeviceCodes = manifestJson.deviceSource || manifestJson.app?.deviceSource || manifestJson.deviceConfig || [];
         deviceSource = Array.isArray(rawDeviceCodes) ? rawDeviceCodes : [rawDeviceCodes];
         
-        const deviceDetails = resolveDeviceDetails(deviceSource);
+        const deviceDetails = resolveDeviceDetails(deviceSource, manifestJson.designWidth);
         deviceSourceNames = deviceDetails.names;
         resolution = deviceDetails.primaryResolution;
       } catch {}
     }
   }
+
+  // Inspect primary watchface script for SDK version & bundler format
+  let sdkVersion: '1.0' | '2.0' | '3.x' = '1.0';
+  let bundlerType: 'standard' | 'minified' | 'webpack' = 'standard';
+  const primaryScriptPath = allFilePaths.find(
+    (p) => p.endsWith('.js') && (p.startsWith('watchface/') || p.startsWith('page/') || p === 'index.js')
+  );
+  if (primaryScriptPath && zip.file(primaryScriptPath)) {
+    try {
+      const scriptText = await zip.file(primaryScriptPath)!.async('string');
+      const compat = detectScriptCompatibility(scriptText);
+      sdkVersion = compat.sdkVersion;
+      bundlerType = compat.bundlerType;
+    } catch {}
+  }
+
+  const resolvedDetails = resolveDeviceDetails(deviceSource, manifestJson?.designWidth);
 
   const packageInfo: PackageMetadata = {
     appName,
@@ -595,7 +629,17 @@ export async function extractManifestMetadata(zip: JSZip, rawBaseName: string): 
     resolution,
     hasIdleDir: allFilePaths.some(p => p.startsWith('idle/') || p.startsWith('page/idle/')),
     hasWatchfaceDir: allFilePaths.some(p => p.startsWith('watchface/') || p.startsWith('page/watchface/')),
-    filesList: allFilePaths
+    filesList: allFilePaths,
+    compatibility: {
+      sdkVersion,
+      bundlerType,
+      polyfillsInjected: false,
+      nativeWidth: resolvedDetails.width,
+      nativeHeight: resolvedDetails.height,
+      screenShape: resolvedDetails.primaryShape,
+      aliasedWidgetsResolved: 0,
+      universalDevicesRegistered: deviceSource.length || UNIVERSAL_TARGET_DEVICES.length
+    }
   };
 
   return { manifestPath, manifestOriginalStr, manifestJson, packageInfo };
@@ -612,6 +656,11 @@ export function generateManifestDiagnostic(
     otherAodPatches: number;
     secondHandUnfrozen?: boolean;
     timePointerFound?: boolean;
+    sdkVersion?: '1.0' | '2.0' | '3.x';
+    bundlerType?: 'standard' | 'minified' | 'webpack';
+    polyfillsInjected?: boolean;
+    aliasedWidgetsResolved?: number;
+    compatibility?: CompatibilityMetadata;
   }
 ): ManifestDiagnosticResult {
   const items: ManifestDiagnosticItem[] = [];
@@ -861,8 +910,13 @@ export function generateManifestDiagnostic(
       timePointerFound: !!scriptTokens?.timePointerFound,
       secondHandUnfrozen: !!scriptTokens?.secondHandUnfrozen,
       visModePatchedCount: scriptTokens?.onlyNormalToAll || 0,
-      showInAodScriptCount: scriptTokens?.showInAodToTrue || 0
+      showInAodScriptCount: scriptTokens?.showInAodToTrue || 0,
+      sdkVersion: scriptTokens?.sdkVersion,
+      bundlerType: scriptTokens?.bundlerType,
+      polyfillsInjected: scriptTokens?.polyfillsInjected,
+      aliasedWidgetsResolved: scriptTokens?.aliasedWidgetsResolved
     },
+    compatibility: scriptTokens?.compatibility,
     overallHealth: showInAodVerified && secondHandVerified ? 'passed' : 'warning'
   };
 }
@@ -962,7 +1016,9 @@ async function patchWatchfaceZip(
 
       if (options.syncManifestTargets) {
         addLog('patch', `Applying Zepp OS Manifest FAOD Synchronization:`);
-        const { repairedCount, summary } = modernizeManifestSchema(manifestJson);
+        const { repairedCount, summary } = modernizeManifestSchema(manifestJson, {
+          preserveNativeResolution: options.preserveNativeResolution !== false
+        });
         for (const msg of summary) {
           addLog('patch', ` -> ${msg}`);
         }
@@ -1154,10 +1210,17 @@ async function patchWatchfaceZip(
           filePatchCount += matchesVisModeNum;
         }
 
-        // Pattern 3B: Neutralize AOD Screen Type Detection and Simple AOD Fallbacks
-        // Watchface developers often write: if (hmSetting.getScreenType() === hmSetting.screen_type.AOD) or getScreenType() === 1
-        // which intentionally hides dials, background textures, or complications in standby mode.
-        const regexAodScreenType = /(?:hmSetting\.getScreenType\(\)|getScreenType\(\))\s*===?\s*(?:hmSetting\.screen_type\.AOD|1\b)/g;
+        // Pattern 3A: Convert hmUI.show_level.ONLY_NORMAL or ONLY_AOD (or aliased/minified show_level) to ALL
+        const regexShowLevelRestrictive = /(?:[a-zA-Z0-9_$]+\.)?show_level\s*:\s*(?:(?:[a-zA-Z0-9_$]+\.)?show_level\.)?(?:ONLY_NORMAL|ONLY_AOD)/g;
+        const matchesShowLevel = (modifiedText.match(regexShowLevelRestrictive) || []).length;
+        if (matchesShowLevel > 0) {
+          modifiedText = modifiedText.replace(regexShowLevelRestrictive, 'show_level: (typeof hmUI !== "undefined" && hmUI.show_level ? hmUI.show_level.ALL : 1)');
+          otherAodPatches += matchesShowLevel;
+          filePatchCount += matchesShowLevel;
+        }
+
+        // Pattern 3B: Neutralize AOD Screen Type Detection and Simple AOD Fallbacks (Zepp OS 1.0, 2.0, and 3.x @zos/settings)
+        const regexAodScreenType = /(?:[a-zA-Z0-9_$]+\.getScreenType\(\)|getScreenType\(\))\s*===?\s*(?:[a-zA-Z0-9_$]+\.screen_type\.AOD|screen_type\.AOD|1\b)/g;
         if (regexAodScreenType.test(modifiedText)) {
           const matchesAodType = (modifiedText.match(regexAodScreenType) || []).length;
           modifiedText = modifiedText.replace(regexAodScreenType, 'false /* bypassed simple AOD fallback */');
@@ -1165,7 +1228,7 @@ async function patchWatchfaceZip(
           filePatchCount += matchesAodType;
         }
 
-        const regexNotAodScreenType = /(?:hmSetting\.getScreenType\(\)|getScreenType\(\))\s*!==?\s*(?:hmSetting\.screen_type\.AOD|1\b)/g;
+        const regexNotAodScreenType = /(?:[a-zA-Z0-9_$]+\.getScreenType\(\)|getScreenType\(\))\s*!==?\s*(?:[a-zA-Z0-9_$]+\.screen_type\.AOD|screen_type\.AOD|1\b)/g;
         if (regexNotAodScreenType.test(modifiedText)) {
           const matchesNotAod = (modifiedText.match(regexNotAodScreenType) || []).length;
           modifiedText = modifiedText.replace(regexNotAodScreenType, 'true /* bypassed simple AOD fallback */');
@@ -1173,7 +1236,7 @@ async function patchWatchfaceZip(
           filePatchCount += matchesNotAod;
         }
 
-        const regexWatchfaceScreenType = /(?:hmSetting\.getScreenType\(\)|getScreenType\(\))\s*===?\s*(?:hmSetting\.screen_type\.WATCHFACE|0\b)/g;
+        const regexWatchfaceScreenType = /(?:[a-zA-Z0-9_$]+\.getScreenType\(\)|getScreenType\(\))\s*===?\s*(?:[a-zA-Z0-9_$]+\.screen_type\.WATCHFACE|screen_type\.WATCHFACE|0\b)/g;
         if (regexWatchfaceScreenType.test(modifiedText)) {
           const matchesWfType = (modifiedText.match(regexWatchfaceScreenType) || []).length;
           modifiedText = modifiedText.replace(regexWatchfaceScreenType, 'true /* forced full dial render */');
@@ -1182,24 +1245,51 @@ async function patchWatchfaceZip(
         }
       }
 
-      // Pattern 4: AST Transformation & 1Hz FAOD Engine
-      if (options.bypassIdleRefreshRate) {
+      // Pattern 4: AST Transformation, 1Hz FAOD Engine & Zepp OS 1.0-3.x API Polyfills
+      const isJsFile = /\.(js|mjs|cjs)$/i.test(filePath);
+      const nativeW = packageInfo.compatibility?.nativeWidth || manifestJson?.designWidth || 480;
+      const nativeH = packageInfo.compatibility?.nativeHeight || nativeW || 480;
+
+      if (options.bypassIdleRefreshRate && isJsFile) {
         try {
           const astResult = transformWatchfaceScript(modifiedText, {
             bypassIdleRefreshRate: options.bypassIdleRefreshRate,
             freezeSecondHandsInAod: options.batteryOptimizations?.freezeSecondHandsInAod ?? false,
-            designWidth: manifestJson?.designWidth || 480,
-            designHeight: 480
+            designWidth: nativeW,
+            designHeight: nativeH,
+            injectZosPolyfills: options.injectZosPolyfills !== false
           });
 
-          if (astResult.secondHandTransformed) {
+          if (astResult.sdkVersionDetected && packageInfo.compatibility && astResult.sdkVersionDetected !== '1.0') {
+            packageInfo.compatibility.sdkVersion = astResult.sdkVersionDetected;
+          }
+          if (astResult.bundlerType && packageInfo.compatibility && astResult.bundlerType !== 'standard') {
+            packageInfo.compatibility.bundlerType = astResult.bundlerType;
+          }
+          if (astResult.aliasedWidgetsResolved && packageInfo.compatibility) {
+            packageInfo.compatibility.aliasedWidgetsResolved += astResult.aliasedWidgetsResolved;
+          }
+          if (astResult.polyfillsInjected && packageInfo.compatibility) {
+            packageInfo.compatibility.polyfillsInjected = true;
+          }
+
+          if (astResult.secondHandTransformed || astResult.polyfillsInjected) {
             modifiedText = astResult.code;
             otherAodPatches++;
             filePatchCount++;
-            addLog('patch', ` -> Successfully transformed second hand to 1Hz FAOD IMG needle & WIDGET_DELEGATE in "${filePath}".`);
+            if (astResult.secondHandTransformed) {
+              addLog('patch', ` -> Successfully transformed second hand to 1Hz FAOD IMG needle & WIDGET_DELEGATE in "${filePath}" (${nativeW}x${nativeH}).`);
+            }
           }
         } catch (astErr) {
           addLog('warn', `AST transformation fallback on "${filePath}": ${astErr}`);
+        }
+      } else if (options.injectZosPolyfills !== false && isJsFile && (filePath.startsWith('watchface/') || filePath.startsWith('idle/') || filePath.startsWith('page/'))) {
+        const polyResult = injectZosCompatibilityPolyfill(modifiedText);
+        if (polyResult.injected) {
+          modifiedText = polyResult.code;
+          if (packageInfo.compatibility) packageInfo.compatibility.polyfillsInjected = true;
+          filePatchCount++;
         }
       }
 
@@ -1215,14 +1305,18 @@ async function patchWatchfaceZip(
       if (filePatchCount > 0) {
         zip.file(filePath, modifiedText);
         scriptFilesModified++;
-        addLog('patch', ` -> Patched "${filePath}": ${filePatchCount} AOD visibility & battery tokens optimized.`);
+        addLog('patch', ` -> Patched "${filePath}": ${filePatchCount} AOD visibility, SDK polyfill & battery tokens optimized.`);
       }
     }
 
     addLog(
       scriptFilesModified > 0 ? 'success' : 'info',
-      `Visibility & Battery Pass complete: ${onlyNormalToAll} 'ONLY_NORMAL'->'ALL', ${showInAodToTrue} 'showInAod: true', ${energyStats.timersThrottled} timers throttled, ${energyStats.sensorsGuarded} sensors guarded.`
+      `Visibility & Compatibility Pass complete: ${onlyNormalToAll} 'ONLY_NORMAL'->'ALL', ${showInAodToTrue} 'showInAod: true', SDK v${packageInfo.compatibility?.sdkVersion || '1.0'} (${packageInfo.compatibility?.bundlerType || 'standard'}).`
     );
+  }
+
+  if (packageInfo.compatibility) {
+    packageInfo.compatibility.universalDevicesRegistered = manifestJson?.deviceSource?.length || UNIVERSAL_TARGET_DEVICES.length;
   }
 
   // 6. Generate In-Depth Manifest Diagnostic Verification
@@ -1235,7 +1329,12 @@ async function patchWatchfaceZip(
       showInAodToTrue,
       otherAodPatches,
       secondHandUnfrozen: true,
-      timePointerFound: true
+      timePointerFound: true,
+      sdkVersion: packageInfo.compatibility?.sdkVersion,
+      bundlerType: packageInfo.compatibility?.bundlerType,
+      polyfillsInjected: packageInfo.compatibility?.polyfillsInjected,
+      aliasedWidgetsResolved: packageInfo.compatibility?.aliasedWidgetsResolved,
+      compatibility: packageInfo.compatibility
     }
   );
 
@@ -1524,7 +1623,10 @@ export async function repatchAodManifestErrors(
   // 1. Load source archive
   const sourceBlob = item.outputBlob || item.file;
   const outerZip = new JSZip();
-  await outerZip.loadAsync(sourceBlob);
+  const sourceBuffer = typeof sourceBlob.arrayBuffer === 'function' 
+    ? await sourceBlob.arrayBuffer() 
+    : sourceBlob;
+  await outerZip.loadAsync(sourceBuffer);
   await normalizeZipEntryPaths(outerZip);
 
   // Check for nested .zpk inside .zip
@@ -1749,9 +1851,10 @@ export async function repatchAodManifestErrors(
   }
   await ensureUbiquitousPreview(targetZipToPatch, manifestJson);
 
-  // E2. Transform JavaScript scripts for 1Hz FAOD compatibility
+  // E2. Transform JavaScript scripts for 1Hz FAOD & Zepp OS 1.0-3.x compatibility
+  const resolvedDims = resolveDeviceDetails(manifestJson?.deviceSource, manifestJson?.designWidth);
   for (const filePath of Object.keys(targetZipToPatch.files)) {
-    if (filePath.endsWith('.js') && (filePath.startsWith('watchface/') || filePath.startsWith('idle/'))) {
+    if (filePath.endsWith('.js') && (filePath.startsWith('watchface/') || filePath.startsWith('idle/') || filePath.startsWith('page/'))) {
       const fileEntry = targetZipToPatch.file(filePath);
       if (fileEntry) {
         try {
@@ -1759,13 +1862,16 @@ export async function repatchAodManifestErrors(
           const astResult = transformWatchfaceScript(originalCode, {
             bypassIdleRefreshRate: true,
             freezeSecondHandsInAod: false,
-            designWidth: manifestJson?.designWidth || 480,
-            designHeight: 480
+            designWidth: resolvedDims.width || manifestJson?.designWidth || 480,
+            designHeight: resolvedDims.height || 480,
+            injectZosPolyfills: options?.injectZosPolyfills !== false
           });
-          if (astResult.secondHandTransformed) {
+          if (astResult.secondHandTransformed || astResult.polyfillsInjected) {
             targetZipToPatch.file(filePath, astResult.code);
             repairedPointersCount++;
-            repairedItemsSummary.push(`Transformed second pointer in "${filePath}" to 1Hz FAOD IMG needle`);
+            if (astResult.secondHandTransformed) {
+              repairedItemsSummary.push(`Transformed second pointer in "${filePath}" to 1Hz FAOD IMG needle`);
+            }
           }
         } catch (scriptErr) {
           addLog('warn', `Could not transform script "${filePath}": ${scriptErr}`);

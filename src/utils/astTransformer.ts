@@ -14,6 +14,7 @@ export interface AstTransformOptions {
   freezeSecondHandsInAod?: boolean;
   designWidth?: number;
   designHeight?: number;
+  injectZosPolyfills?: boolean;
 }
 
 export interface ExtractedNeedle {
@@ -26,6 +27,13 @@ export interface ExtractedNeedle {
   coverPath?: string;
 }
 
+export interface ScriptCompatibilityInfo {
+  sdkVersion: '1.0' | '2.0' | '3.x';
+  bundlerType: 'standard' | 'minified' | 'webpack';
+  hasZosImports: boolean;
+  aliasedUiNamespace?: string;
+}
+
 export interface AstTransformResult {
   code: string;
   secondHandTransformed: boolean;
@@ -33,6 +41,127 @@ export interface AstTransformResult {
   delegateInjected: boolean;
   digitalClockDetected?: boolean;
   digitalSecondsDetected?: boolean;
+  sdkVersionDetected?: '1.0' | '2.0' | '3.x';
+  bundlerType?: 'standard' | 'minified' | 'webpack';
+  polyfillsInjected?: boolean;
+  aliasedWidgetsResolved?: number;
+}
+
+/**
+ * Inspects watchface script content to determine Zepp OS SDK generation and bundler format.
+ */
+export function detectScriptCompatibility(scriptContent: string): ScriptCompatibilityInfo {
+  const hasZosImports = /@zos\/(ui|sensor|settings|display|interaction|utils|fs|BLE|ble)/.test(scriptContent);
+  const hasZos2Core = /DeviceRuntimeCore|__$$hmAppManager$$__|hmUI\.createWidget/.test(scriptContent);
+
+  let sdkVersion: '1.0' | '2.0' | '3.x' = '1.0';
+  if (hasZosImports) {
+    sdkVersion = '3.x';
+  } else if (/DeviceRuntimeCore|hmApp\.registerGestureEvent|hmFS\.SysProGetInt/.test(scriptContent)) {
+    sdkVersion = '2.0';
+  } else if (hasZos2Core) {
+    sdkVersion = '1.0';
+  }
+
+  let bundlerType: 'standard' | 'minified' | 'webpack' = 'standard';
+  if (/__webpack_require__|webpackJsonp|__webpack_modules__|__esModule/.test(scriptContent)) {
+    bundlerType = 'webpack';
+  } else {
+    const lines = scriptContent.split('\n').filter((l) => l.trim().length > 0);
+    const maxLineLen = lines.reduce((max, l) => Math.max(max, l.length), 0);
+    const hasMinifiedIife = /^!function\s*\(|^\(function\s*\([a-z],[a-z]\)/.test(scriptContent.trim());
+    const hasAliasedWidget = /\b(?!(?:hmUI)\b)([a-zA-Z0-9_$]{1,6})\.createWidget\s*\(\s*\1\.widget\./.test(scriptContent);
+    if (hasMinifiedIife || hasAliasedWidget || (lines.length <= 8 && maxLineLen > 320)) {
+      bundlerType = 'minified';
+    }
+  }
+
+  // Detect if @zos/ui or hmUI is aliased to a custom identifier (e.g. _ui.createWidget)
+  const aliasMatch = scriptContent.match(/\b([a-zA-Z0-9_$]+)\.createWidget\s*\(\s*(?:\1\.widget\.|hmUI\.widget\.|widget\.)/);
+  const aliasedUiNamespace = aliasMatch && aliasMatch[1] !== 'hmUI' ? aliasMatch[1] : undefined;
+
+  return {
+    sdkVersion,
+    bundlerType,
+    hasZosImports,
+    aliasedUiNamespace,
+  };
+}
+
+/**
+ * Injects bidirectional Zepp OS 1.0 <-> 2.0 <-> 3.x API compatibility polyfills
+ * safely after any top-level ES module import statements.
+ */
+export function injectZosCompatibilityPolyfill(scriptContent: string): { code: string; injected: boolean } {
+  if (scriptContent.includes('__ZOS_UNIVERSAL_COMPAT_SHIM__')) {
+    return { code: scriptContent, injected: false };
+  }
+
+  const compatInfo = detectScriptCompatibility(scriptContent);
+  // Find the end of any top-level ES `import ...` declarations so we never break ES module syntax
+  const importRegex = /^[ \t]*import\s+(?:[\s\S]*?from\s+['"][^'"]+['"]|['"][^'"]+['"])\s*;?[ \t]*$/gm;
+  let lastImportEnd = 0;
+  let match: RegExpExecArray | null;
+  while ((match = importRegex.exec(scriptContent)) !== null) {
+    lastImportEnd = match.index + match[0].length;
+  }
+
+  // Also capture imported identifiers from @zos/ui or @zos/sensor if present
+  const hasBareCreateWidget = /import\s*\{[^}]*\bcreateWidget\b[^}]*\}\s*from\s*['"]@zos\/ui['"]/.test(scriptContent);
+  const hasBareWidgetEnum = /import\s*\{[^}]*\bwidget\b[^}]*\}\s*from\s*['"]@zos\/ui['"]/.test(scriptContent);
+  const hasBareShowLevel = /import\s*\{[^}]*\bshow_level\b[^}]*\}\s*from\s*['"]@zos\/ui['"]/.test(scriptContent);
+  const hasBareProp = /import\s*\{[^}]*\bprop\b[^}]*\}\s*from\s*['"]@zos\/ui['"]/.test(scriptContent);
+  const hasTimeClassImport = /import\s*\{[^}]*\bTime\b[^}]*\}\s*from\s*['"]@zos\/sensor['"]/.test(scriptContent);
+
+  const zosBridgeLines: string[] = [];
+  if (hasBareCreateWidget) {
+    zosBridgeLines.push(`  if (typeof createWidget === 'function' && !__g__.hmUI.createWidget) __g__.hmUI.createWidget = createWidget;`);
+  }
+  if (hasBareWidgetEnum) {
+    zosBridgeLines.push(`  if (typeof widget !== 'undefined' && widget) __g__.hmUI.widget = Object.assign(__g__.hmUI.widget || {}, widget);`);
+  }
+  if (hasBareShowLevel) {
+    zosBridgeLines.push(`  if (typeof show_level !== 'undefined' && show_level) __g__.hmUI.show_level = Object.assign(__g__.hmUI.show_level || {}, show_level);`);
+  }
+  if (hasBareProp) {
+    zosBridgeLines.push(`  if (typeof prop !== 'undefined' && prop) __g__.hmUI.prop = Object.assign(__g__.hmUI.prop || {}, prop);`);
+  }
+  if (hasTimeClassImport) {
+    zosBridgeLines.push(`  if (typeof Time === 'function' && (!__g__.hmSensor || !__g__.hmSensor.createSensor)) { __g__.hmSensor = __g__.hmSensor || { id: { TIME: 'TIME' }, event: { CHANGE: 'CHANGE' } }; __g__.hmSensor.createSensor = function(id) { if (id === __g__.hmSensor.id.TIME || id === 'TIME') { var t = new Time(); return { get second() { return typeof t.getSeconds === 'function' ? t.getSeconds() : (new Date()).getSeconds(); }, get minute() { return typeof t.getMinutes === 'function' ? t.getMinutes() : (new Date()).getMinutes(); }, get hour() { return typeof t.getHours === 'function' ? t.getHours() : (new Date()).getHours(); }, addEventListener: function(ev, cb) { if (typeof t.onPerMinute === 'function') t.onPerMinute(cb); } }; } return {}; }; }`);
+  }
+  if (compatInfo.aliasedUiNamespace) {
+    zosBridgeLines.push(`  try { if (typeof ${compatInfo.aliasedUiNamespace} !== 'undefined' && ${compatInfo.aliasedUiNamespace} && ${compatInfo.aliasedUiNamespace}.createWidget && !__g__.hmUI.createWidget) { __g__.hmUI = ${compatInfo.aliasedUiNamespace}; } } catch(_e){}`);
+  }
+
+  const shimBlock = `/* __ZOS_UNIVERSAL_COMPAT_SHIM__ (Zepp OS 1.0 / 2.0 / 3.x Bridge) */
+(function() {
+  try {
+    var __g__ = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : (typeof global !== 'undefined' ? global : Function('return this')()));
+    if (!__g__) return;
+    __g__.hmUI = __g__.hmUI || {};
+    __g__.hmUI.show_level = __g__.hmUI.show_level || { ALL: 1, ONLY_NORMAL: 1, ONLY_AOD: 1, ONAL_NORAML: 1 };
+    __g__.hmUI.vis_mode = __g__.hmUI.vis_mode || { ALL: 0, ONLY_NORMAL: 0, ONLY_AOD: 0 };
+    __g__.hmUI.widget = __g__.hmUI.widget || { IMG: 1, TEXT: 2, ARC: 3, FILL_RECT: 4, STROKE_RECT: 5, IMG_TIME: 6, TEXT_TIME: 7, IMG_NUMBER: 8, TIME_POINTER: 9, WIDGET_DELEGATE: 10, IMG_LEVEL: 11, IMG_PROGRESS: 12, CIRCLE: 13, IMG_STATUS: 14, IMG_WEEK: 15, IMG_DATE: 16, SPORT_DATA: 17, HISTOGRAM: 18, IMG_ANIM: 19, GROUP: 20 };
+    __g__.hmUI.prop = __g__.hmUI.prop || { MORE: 1, ANGLE: 2, POS_X: 3, POS_Y: 4, CENTER_X: 5, CENTER_Y: 6, SRC: 7, TEXT: 8, VISIBLE: 9, ALPHA: 10, CURRENT_TYPE: 11, VALUE: 12 };
+    __g__.hmSetting = __g__.hmSetting || { screen_type: { WATCHFACE: 0, AOD: 1, SETTINGS: 2 }, getScreenType: function() { return 0; } };
+    __g__.hmSensor = __g__.hmSensor || { id: { TIME: 1, BATTERY: 2, STEP: 3, CALORIE: 4, HEART: 5, PAI: 6, DISTANCE: 7, STAND: 8, WEATHER: 9, SLEEP: 10 }, event: { CHANGE: 1, LAST: 2 }, createSensor: function() { return { get second() { return (new Date()).getSeconds(); }, get minute() { return (new Date()).getMinutes(); }, get hour() { return (new Date()).getHours(); }, addEventListener: function() {} }; } };
+${zosBridgeLines.length > 0 ? zosBridgeLines.join('\n') + '\n' : ''}  } catch (__compatErr) {}
+})();
+`;
+
+  if (lastImportEnd > 0) {
+    const before = scriptContent.slice(0, lastImportEnd);
+    const after = scriptContent.slice(lastImportEnd);
+    return {
+      code: `${before}\n${shimBlock}${after}`,
+      injected: true,
+    };
+  }
+
+  return {
+    code: `${shimBlock}\n${scriptContent}`,
+    injected: true,
+  };
 }
 
 /**
@@ -219,10 +348,11 @@ function parseCleanString(val: string | undefined, fallback: string): string {
 }
 
 /**
- * Locates the optimal injection point for the WIDGET_DELEGATE lifecycle engine.
+ * Locates the optimal injection point for the WIDGET_DELEGATE lifecycle engine,
+ * supporting standard methods, ES5 colon-function methods, and minified arrow functions.
  */
 function findLifecycleInjectionPoint(src: string): { type: 'method_end' | 'fallback'; index: number } {
-  const methodMatch = src.match(/(?:init_view|initView|build)\s*\([^)]*\)\s*\{/);
+  const methodMatch = src.match(/(?:init_view|initView|build)\s*(?::\s*(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?|\([^)]*\)\s*)\{/);
   if (methodMatch && methodMatch.index !== undefined) {
     const braceStart = methodMatch.index + methodMatch[0].lastIndexOf('{');
     const braceEnd = findMatchingBrace(src, braceStart);
@@ -234,10 +364,10 @@ function findLifecycleInjectionPoint(src: string): { type: 'method_end' | 'fallb
 }
 
 /**
- * Injects timer cleanup into onDestroy() or onDestory().
+ * Injects timer cleanup into onDestroy() or onDestory() (both standard and minified ES5 syntax).
  */
 function injectDestroyCleanup(src: string): string {
-  const match = src.match(/(?:onDestroy|onDestory)\s*\([^)]*\)\s*\{/);
+  const match = src.match(/(?:onDestroy|onDestory)\s*(?::\s*(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?|\([^)]*\)\s*)\{/);
   if (match && match.index !== undefined) {
     const insertPos = match.index + match[0].length;
     const cleanupCode = `\n    try { if (typeof __faodSecondTimer__ !== 'undefined' && __faodSecondTimer__) { clearInterval(__faodSecondTimer__); __faodSecondTimer__ = null; } } catch(e){}`;
@@ -248,6 +378,7 @@ function injectDestroyCleanup(src: string): string {
 
 /**
  * Core transformation routine conforming to PROJECT.md interface contract.
+ * Supports Zepp OS 1.0, 2.0, and 3.x (@zos/*), as well as minified and Webpack-bundled watchfaces.
  */
 export function transformWatchfaceScript(
   scriptContent: string,
@@ -256,13 +387,15 @@ export function transformWatchfaceScript(
   const bypass = options.bypassIdleRefreshRate !== false;
   const freezeInAod = options.freezeSecondHandsInAod === true;
   const designWidth = options.designWidth || 480;
-  const designHeight = options.designHeight || 480;
+  const designHeight = options.designHeight || designWidth || 480;
   const defaultCenterX = Math.round(designWidth / 2);
   const defaultCenterY = Math.round(designHeight / 2);
 
+  const compatInfo = detectScriptCompatibility(scriptContent);
   const needlesExtracted: ExtractedNeedle[] = [];
   let secondHandTransformed = false;
   let delegateInjected = false;
+  let aliasedWidgetsResolved = 0;
 
   if (!bypass) {
     return {
@@ -270,6 +403,10 @@ export function transformWatchfaceScript(
       secondHandTransformed: false,
       needlesExtracted: [],
       delegateInjected: false,
+      sdkVersionDetected: compatInfo.sdkVersion,
+      bundlerType: compatInfo.bundlerType,
+      polyfillsInjected: false,
+      aliasedWidgetsResolved: 0,
     };
   }
 
@@ -277,8 +414,10 @@ export function transformWatchfaceScript(
   const alreadyHasDelegate = scriptContent.includes('WIDGET_DELEGATE');
   const alreadyHasFaodEngine = scriptContent.includes('__faodUpdateSecondHand__');
 
-  // Match all TIME_POINTER widget creations
-  const timePointerPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]+)\s*=\s*)?(?:(hmUI\.)?createWidget\s*\(\s*(?:hmUI\.widget\.|widget\.)?TIME_POINTER\s*,\s*)/g;
+  // Match all TIME_POINTER widget creations:
+  // Supports hmUI.createWidget(hmUI.widget.TIME_POINTER, ...), createWidget(widget.TIME_POINTER, ...),
+  // and minified/aliased namespaces like _ui.createWidget(_ui.widget.TIME_POINTER, ...)
+  const timePointerPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]+)\s*=\s*)?(?:([a-zA-Z0-9_$]+\.)?createWidget\s*\(\s*(?:([a-zA-Z0-9_$]+)\.widget\.|widget\.)?TIME_POINTER\s*,\s*)/g;
 
   interface WidgetReplacement {
     start: number;
@@ -295,7 +434,12 @@ export function transformWatchfaceScript(
   while ((match = timePointerPattern.exec(scriptContent)) !== null) {
     const fullMatchStart = match.index;
     const assignedVar = match[1];
-    const prefixHmUi = match[2] ? 'hmUI.' : '';
+    const callerPrefix = match[2] || ''; // e.g., 'hmUI.' or '_ui.' or ''
+    const widgetNamespace = match[3] ? `${match[3]}.widget.` : callerPrefix ? `${callerPrefix}widget.` : 'widget.';
+
+    if (callerPrefix !== 'hmUI.') {
+      aliasedWidgetsResolved++;
+    }
 
     const braceStart = scriptContent.indexOf('{', fullMatchStart + match[0].length - 1);
     if (braceStart === -1) continue;
@@ -387,7 +531,7 @@ export function transformWatchfaceScript(
           targetNeedleVars.push(assignedVar);
         }
 
-        let replacement = `${assignedVar ? `${assignedVar} = ` : `var ${targetVar} = `}${prefixHmUi}createWidget(${prefixHmUi}widget.IMG, {
+        let replacement = `${assignedVar ? `${assignedVar} = ` : `var ${targetVar} = `}${callerPrefix}createWidget(${widgetNamespace}IMG, {
           x: 0,
           y: 0,
           w: ${designWidth},
@@ -404,7 +548,7 @@ export function transformWatchfaceScript(
 
         if (coverPath) {
           const coverPivot = calculateNeedlePivot(centerX, centerY, coverPosX, coverPosY);
-          replacement += `\n${prefixHmUi}createWidget(${prefixHmUi}widget.IMG, {
+          replacement += `\n${callerPrefix}createWidget(${widgetNamespace}IMG, {
           x: 0,
           y: 0,
           w: ${designWidth},
@@ -436,7 +580,7 @@ export function transformWatchfaceScript(
 
         const strippedCall = scriptContent.slice(fullMatchStart, braceStart) + strippedConfig + scriptContent.slice(braceEnd + 1, statementEnd);
 
-        let replacement = `${strippedCall}\nvar ${synthVar} = ${prefixHmUi}createWidget(${prefixHmUi}widget.IMG, {
+        let replacement = `${strippedCall}\nvar ${synthVar} = ${callerPrefix}createWidget(${widgetNamespace}IMG, {
           x: 0,
           y: 0,
           w: ${designWidth},
@@ -453,7 +597,7 @@ export function transformWatchfaceScript(
 
         if (coverPath) {
           const coverPivot = calculateNeedlePivot(centerX, centerY, coverPosX, coverPosY);
-          replacement += `\n${prefixHmUi}createWidget(${prefixHmUi}widget.IMG, {
+          replacement += `\n${callerPrefix}createWidget(${widgetNamespace}IMG, {
           x: 0,
           y: 0,
           w: ${designWidth},
@@ -481,10 +625,10 @@ export function transformWatchfaceScript(
     }
   }
 
-  // Match digital clock widget creations: IMG_TIME and TEXT_TIME
-  const digitalClockPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]+)\s*=\s*)?(?:(hmUI\.)?createWidget\s*\(\s*(?:hmUI\.widget\.|widget\.)?(IMG_TIME|TEXT_TIME)\s*,\s*)/g;
+  // Match digital clock widget creations: IMG_TIME and TEXT_TIME (including aliased namespaces)
+  const digitalClockPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]+)\s*=\s*)?(?:([a-zA-Z0-9_$]+\.)?createWidget\s*\(\s*(?:[a-zA-Z0-9_$]+\.widget\.|widget\.)?(IMG_TIME|TEXT_TIME)\s*,\s*)/g;
   // Match discrete digital second widget creations: IMG_NUMBER or TEXT assigned to sec/second variables
-  const digitalSecWidgetPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]*sec[a-zA-Z0-9_$.]*|[a-zA-Z0-9_$.]*second[a-zA-Z0-9_$.]*)\s*=\s*)(?:(hmUI\.)?createWidget\s*\(\s*(?:hmUI\.widget\.|widget\.)?(IMG_NUMBER|TEXT)\s*,\s*)/gi;
+  const digitalSecWidgetPattern = /(?:(?:(?:const|let|var)\s+)?([a-zA-Z0-9_$.]*sec[a-zA-Z0-9_$.]*|[a-zA-Z0-9_$.]*second[a-zA-Z0-9_$.]*)\s*=\s*)(?:([a-zA-Z0-9_$]+\.)?createWidget\s*\(\s*(?:[a-zA-Z0-9_$]+\.widget\.|widget\.)?(IMG_NUMBER|TEXT)\s*,\s*)/gi;
 
   const targetDigitalTimeVars: string[] = [];
   const targetDigitalSecVars: string[] = [];
@@ -495,6 +639,10 @@ export function transformWatchfaceScript(
   while ((digMatch = digitalClockPattern.exec(scriptContent)) !== null) {
     const fullMatchStart = digMatch.index;
     const assignedVar = digMatch[1];
+    const callerPrefix = digMatch[2] || '';
+    if (callerPrefix !== 'hmUI.') {
+      aliasedWidgetsResolved++;
+    }
     const braceStart = scriptContent.indexOf('{', fullMatchStart + digMatch[0].length - 1);
     if (braceStart === -1) continue;
     const braceEnd = findMatchingBrace(scriptContent, braceStart);
@@ -519,7 +667,7 @@ export function transformWatchfaceScript(
         : '(typeof hmUI !== "undefined" && hmUI.show_level ? hmUI.show_level.ALL : 1)';
 
       const updatedConfig = configStr.replace(
-        /(?:hmUI\.)?(?:show_level\.)?ONLY_NORMAL/g,
+        /(?:[a-zA-Z0-9_$]+\.)?(?:show_level\.)?ONLY_NORMAL/g,
         showLevelExpr
       );
 
@@ -554,7 +702,7 @@ export function transformWatchfaceScript(
         : '(typeof hmUI !== "undefined" && hmUI.show_level ? hmUI.show_level.ALL : 1)';
 
       const updatedConfig = configStr.replace(
-        /(?:hmUI\.)?(?:show_level\.)?ONLY_NORMAL/g,
+        /(?:[a-zA-Z0-9_$]+\.)?(?:show_level\.)?ONLY_NORMAL/g,
         showLevelExpr
       );
 
@@ -582,7 +730,7 @@ export function transformWatchfaceScript(
     const needleUpdateLines = uniqueTargets
       .map(
         (v) =>
-          `    if (typeof ${v} !== 'undefined' && ${v} && ${v}.setProperty) { ${v}.setProperty(hmUI.prop.ANGLE, __angle__); }`
+          `    if (typeof ${v} !== 'undefined' && ${v} && ${v}.setProperty) { ${v}.setProperty(typeof hmUI !== 'undefined' && hmUI.prop ? hmUI.prop.ANGLE : 2, __angle__); }`
       )
       .join('\n');
 
@@ -601,6 +749,10 @@ export function transformWatchfaceScript(
           `    if (typeof ${v} !== 'undefined' && ${v} && ${v}.setProperty) { try { if (typeof hmUI.prop.MORE !== 'undefined') ${v}.setProperty(hmUI.prop.MORE, {}); } catch(e){} }`
       )
       .join('\n');
+
+    const delegateCreateExpr = compatInfo.aliasedUiNamespace
+      ? `(typeof hmUI !== 'undefined' && hmUI.createWidget ? hmUI : ${compatInfo.aliasedUiNamespace}).createWidget((typeof hmUI !== 'undefined' && hmUI.widget ? hmUI.widget.WIDGET_DELEGATE : ${compatInfo.aliasedUiNamespace}.widget.WIDGET_DELEGATE)`
+      : `hmUI.createWidget(hmUI.widget.WIDGET_DELEGATE`;
 
     const faodEngineBlock = `
 /* === FAOD 1Hz ACTIVE SECOND HAND & DIGITAL CLOCK ENGINE INJECTED === */
@@ -630,8 +782,8 @@ try {
 } catch (__listenerErr) {}
 
 try {
-  if (typeof hmUI !== 'undefined' && hmUI && hmUI.widget && hmUI.widget.WIDGET_DELEGATE) {
-    hmUI.createWidget(hmUI.widget.WIDGET_DELEGATE, {
+  if ((typeof hmUI !== 'undefined' && hmUI && hmUI.widget && hmUI.widget.WIDGET_DELEGATE)${compatInfo.aliasedUiNamespace ? ` || (typeof ${compatInfo.aliasedUiNamespace} !== 'undefined' && ${compatInfo.aliasedUiNamespace}.widget)` : ''}) {
+    ${delegateCreateExpr}, {
       resume_call: function() {
         ${freezeInAod ? 'var __st__ = (typeof hmSetting !== "undefined" && hmSetting.getScreenType) ? hmSetting.getScreenType() : 0; if (__st__ === 1) return;' : ''}
         __faodUpdateSecondHand__();
@@ -661,6 +813,14 @@ try {
     delegateInjected = true;
   }
 
+  // Inject Zepp OS 1.0 - 3.x polyfills if requested via options OR if @zos/* / aliased namespaces were detected
+  let polyfillsInjected = false;
+  if (options.injectZosPolyfills === true || compatInfo.hasZosImports || compatInfo.aliasedUiNamespace) {
+    const polyResult = injectZosCompatibilityPolyfill(mutatedCode);
+    mutatedCode = polyResult.code;
+    polyfillsInjected = polyResult.injected;
+  }
+
   return {
     code: mutatedCode,
     secondHandTransformed: secondHandTransformed || digitalSecondsDetected,
@@ -668,5 +828,10 @@ try {
     delegateInjected,
     digitalClockDetected,
     digitalSecondsDetected,
+    sdkVersionDetected: compatInfo.sdkVersion,
+    bundlerType: compatInfo.bundlerType,
+    polyfillsInjected,
+    aliasedWidgetsResolved,
   };
 }
+

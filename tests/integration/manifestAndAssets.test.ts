@@ -346,4 +346,56 @@ describe('Milestone 2: Manifest Modernization & Asset Mirroring', () => {
     expect(outZip.file('preview.png')).not.toBeNull();
     expect(outZip.file('idle/preview.png')).not.toBeNull();
   });
+
+  it('Compatibility: Preserves native non-480x480 resolution (e.g. 390x450 square GTS 4) and injects Zepp OS 3.x polyfills', async () => {
+    const gts4Manifest = {
+      configVersion: 'v3',
+      designWidth: 390,
+      app: { appId: 99887, appName: 'GTS 4 Square WF' },
+      deviceSource: ['0x00000063'],
+      module: {
+        watchface: { path: 'watchface/index' }
+      }
+    };
+
+    const zipBuffer = await buildTestZip({
+      manifest: gts4Manifest,
+      files: {
+        'watchface/index.js': `import { createWidget, widget } from '@zos/ui';\nWatchFace({ build() { createWidget(widget.TIME_POINTER, { second_path: 'sec.png', second_centerX: 195, second_centerY: 225, second_posX: 10, second_posY: 180 }); } });`,
+        'assets/preview.png': sample1x1Png,
+        'assets/sec.png': sample1x1Png
+      }
+    });
+
+    const file = new File([new Uint8Array(zipBuffer)], 'gts4_square.zip', { type: 'application/zip' });
+    const item: WatchfaceFileItem = {
+      id: 'test-gts4-compat',
+      file,
+      name: 'gts4_square.zip',
+      size: zipBuffer.byteLength,
+      status: 'idle',
+      progress: 0,
+      logs: [],
+      createdAt: Date.now()
+    };
+
+    const result = await convertWatchfacePackage(item, DEFAULT_CONVERSION_OPTIONS);
+    expect(result.packageInfo.compatibility?.sdkVersion).toBe('3.x');
+    expect(result.packageInfo.compatibility?.nativeWidth).toBe(390);
+    expect(result.packageInfo.compatibility?.nativeHeight).toBe(450);
+    expect(result.packageInfo.compatibility?.screenShape).toBe('square');
+    expect(result.packageInfo.compatibility?.polyfillsInjected).toBe(true);
+
+    const outZip = await JSZip.loadAsync(await result.outputBlob.arrayBuffer());
+    const manifest = JSON.parse(await outZip.file('app.json')!.async('string'));
+    expect(manifest.designWidth).toBe(390);
+    expect(manifest.deviceSource).toContain('0x00000063');
+    expect(manifest.deviceSource).toContain('0x0000008F'); // T-Rex 3 included in expanded universal list
+
+    const idleScript = await outZip.file('idle/index.js')!.async('string');
+    expect(idleScript).toContain('__ZOS_UNIVERSAL_COMPAT_SHIM__');
+    expect(idleScript).toContain('w: 390');
+    expect(idleScript).toContain('h: 450');
+  });
 });
+
